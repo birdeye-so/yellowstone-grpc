@@ -1,21 +1,18 @@
 // GrpcClient: A persistent, reusable gRPC client
 
-use napi::bindgen_prelude::PromiseRaw;
+use napi::bindgen_prelude::{Buffer, PromiseRaw};
 use napi::Env;
 use napi_derive::napi;
+use prost::Message;
 use yellowstone_grpc_client::GeyserGrpcClient;
-use yellowstone_grpc_proto::geyser::CommitmentLevel;
+use yellowstone_grpc_proto::geyser::{
+  CommitmentLevel, GetBlockHeightRequest, GetLatestBlockhashRequest, GetSlotRequest,
+  GetVersionRequest, IsBlockhashValidRequest, PingRequest, SubscribeReplayInfoRequest,
+};
 
 use crate::{
-  bindings::JsChannelOptions,
-  init_crypto_provider,
-  js_types::{
-    JsGetBlockHeightRequest, JsGetBlockHeightResponse, JsGetLatestBlockhashRequest,
-    JsGetLatestBlockhashResponse, JsGetSlotRequest, JsGetSlotResponse, JsGetVersionRequest,
-    JsGetVersionResponse, JsIsBlockhashValidRequest, JsIsBlockhashValidResponse, JsPingRequest,
-    JsPongResponse, JsSubscribeReplayInfoRequest, JsSubscribeReplayInfoResponse,
-  },
-  utils,
+  bindings::{JsChannelOptions, JsReconnectConfig},
+  init_crypto_provider, utils,
 };
 
 fn napi_error_with_cause(
@@ -36,11 +33,17 @@ fn napi_error_with_cause(
   error
 }
 
-fn napi_error(status: napi::Status, reason: impl Into<String>) -> napi::Error {
-  let reason = reason.into();
-  let mut error = napi::Error::new(status, reason.clone());
-  error.set_cause(napi::Error::new(status, reason));
-  error
+fn decode_request<T>(request_bytes: Buffer, message_name: &'static str) -> napi::Result<T>
+where
+  T: Message + Default,
+{
+  T::decode(request_bytes.as_ref()).map_err(|error| {
+    napi_error_with_cause(
+      napi::Status::InvalidArg,
+      format!("invalid {message_name} payload"),
+      &error,
+    )
+  })
 }
 
 /// Main client struct exposed to JavaScript via NAPI.
@@ -68,11 +71,13 @@ impl GrpcClient {
     endpoint: String,
     x_token: Option<String>,
     channel_options: Option<JsChannelOptions>,
+    reconnect_config: Option<JsReconnectConfig>,
   ) -> napi::Result<Self> {
     init_crypto_provider();
 
     // Build the client with the provided configuration
-    let builder = utils::get_client_builder(endpoint, x_token, channel_options).await?;
+    let builder =
+      utils::get_client_builder(endpoint, x_token, channel_options, reconnect_config).await?;
 
     // Connect and get the client (returns GeyserGrpcClient<impl Interceptor>)
     let client = builder.connect().await.map_err(|error| {
@@ -83,15 +88,17 @@ impl GrpcClient {
       )
     })?;
 
-    Ok(Self { client: client })
+    Ok(Self { client })
   }
 
   #[napi]
   pub fn get_latest_blockhash<'env>(
     &self,
     environment: &'env Env,
-    request: JsGetLatestBlockhashRequest,
-  ) -> napi::Result<PromiseRaw<'env, JsGetLatestBlockhashResponse>> {
+    request_bytes: Buffer,
+  ) -> napi::Result<PromiseRaw<'env, Buffer>> {
+    let request: GetLatestBlockhashRequest =
+      decode_request(request_bytes, "GetLatestBlockhashRequest")?;
     let commitment_level_option = request
       .commitment
       .and_then(|c| CommitmentLevel::try_from(c).ok());
@@ -111,14 +118,9 @@ impl GrpcClient {
             )
           })?;
 
-        Ok(protobuf_response)
+        Ok(protobuf_response.encode_to_vec())
       },
-      move |callback_environment, protobuf_response| {
-        JsGetLatestBlockhashResponse::from_protobuf_to_js_type(
-          callback_environment,
-          protobuf_response,
-        )
-      },
+      move |_callback_environment, response_bytes| Ok(Buffer::from(response_bytes)),
     )
   }
 
@@ -126,8 +128,9 @@ impl GrpcClient {
   pub fn ping<'env>(
     &self,
     environment: &'env Env,
-    request: JsPingRequest,
-  ) -> napi::Result<PromiseRaw<'env, JsPongResponse>> {
+    request_bytes: Buffer,
+  ) -> napi::Result<PromiseRaw<'env, Buffer>> {
+    let request: PingRequest = decode_request(request_bytes, "PingRequest")?;
     let ping_count = request.count;
 
     let mut client = self.client.clone();
@@ -138,11 +141,9 @@ impl GrpcClient {
           napi_error_with_cause(napi::Status::GenericFailure, "ping request failed", &error)
         })?;
 
-        Ok(protobuf_response)
+        Ok(protobuf_response.encode_to_vec())
       },
-      move |callback_environment, protobuf_response| {
-        JsPongResponse::from_protobuf_to_js_type(callback_environment, protobuf_response)
-      },
+      move |_callback_environment, response_bytes| Ok(Buffer::from(response_bytes)),
     )
   }
 
@@ -150,8 +151,9 @@ impl GrpcClient {
   pub fn get_block_height<'env>(
     &self,
     environment: &'env Env,
-    request: JsGetBlockHeightRequest,
-  ) -> napi::Result<PromiseRaw<'env, JsGetBlockHeightResponse>> {
+    request_bytes: Buffer,
+  ) -> napi::Result<PromiseRaw<'env, Buffer>> {
+    let request: GetBlockHeightRequest = decode_request(request_bytes, "GetBlockHeightRequest")?;
     let commitment_level_option = request
       .commitment
       .and_then(|c| CommitmentLevel::try_from(c).ok());
@@ -171,11 +173,9 @@ impl GrpcClient {
             )
           })?;
 
-        Ok(protobuf_response)
+        Ok(protobuf_response.encode_to_vec())
       },
-      move |callback_environment, protobuf_response| {
-        JsGetBlockHeightResponse::from_protobuf_to_js_type(callback_environment, protobuf_response)
-      },
+      move |_callback_environment, response_bytes| Ok(Buffer::from(response_bytes)),
     )
   }
 
@@ -183,8 +183,9 @@ impl GrpcClient {
   pub fn get_slot<'env>(
     &self,
     environment: &'env Env,
-    request: JsGetSlotRequest,
-  ) -> napi::Result<PromiseRaw<'env, JsGetSlotResponse>> {
+    request_bytes: Buffer,
+  ) -> napi::Result<PromiseRaw<'env, Buffer>> {
+    let request: GetSlotRequest = decode_request(request_bytes, "GetSlotRequest")?;
     let commitment_level_option = request
       .commitment
       .and_then(|c| CommitmentLevel::try_from(c).ok());
@@ -205,11 +206,9 @@ impl GrpcClient {
               )
             })?;
 
-        Ok(protobuf_response)
+        Ok(protobuf_response.encode_to_vec())
       },
-      move |callback_environment, protobuf_response| {
-        JsGetSlotResponse::from_protobuf_to_js_type(callback_environment, protobuf_response)
-      },
+      move |_callback_environment, response_bytes| Ok(Buffer::from(response_bytes)),
     )
   }
 
@@ -217,8 +216,10 @@ impl GrpcClient {
   pub fn is_blockhash_valid<'env>(
     &self,
     environment: &'env Env,
-    request: JsIsBlockhashValidRequest,
-  ) -> napi::Result<PromiseRaw<'env, JsIsBlockhashValidResponse>> {
+    request_bytes: Buffer,
+  ) -> napi::Result<PromiseRaw<'env, Buffer>> {
+    let request: IsBlockhashValidRequest =
+      decode_request(request_bytes, "IsBlockhashValidRequest")?;
     let blockhash_value = request.blockhash;
     let commitment_level_option = request
       .commitment
@@ -239,14 +240,9 @@ impl GrpcClient {
             )
           })?;
 
-        Ok(protobuf_response)
+        Ok(protobuf_response.encode_to_vec())
       },
-      move |callback_environment, protobuf_response| {
-        JsIsBlockhashValidResponse::from_protobuf_to_js_type(
-          callback_environment,
-          protobuf_response,
-        )
-      },
+      move |_callback_environment, response_bytes| Ok(Buffer::from(response_bytes)),
     )
   }
 
@@ -254,8 +250,9 @@ impl GrpcClient {
   pub fn get_version<'env>(
     &self,
     environment: &'env Env,
-    _get_version_request: JsGetVersionRequest,
-  ) -> napi::Result<PromiseRaw<'env, JsGetVersionResponse>> {
+    request_bytes: Buffer,
+  ) -> napi::Result<PromiseRaw<'env, Buffer>> {
+    let _request: GetVersionRequest = decode_request(request_bytes, "GetVersionRequest")?;
     let mut client = self.client.clone();
 
     environment.spawn_future_with_callback(
@@ -268,11 +265,9 @@ impl GrpcClient {
           )
         })?;
 
-        Ok(protobuf_response)
+        Ok(protobuf_response.encode_to_vec())
       },
-      move |callback_environment, protobuf_response| {
-        JsGetVersionResponse::from_protobuf_to_js_type(callback_environment, protobuf_response)
-      },
+      move |_callback_environment, response_bytes| Ok(Buffer::from(response_bytes)),
     )
   }
 
@@ -280,8 +275,10 @@ impl GrpcClient {
   pub fn subscribe_replay_info<'env>(
     &self,
     environment: &'env Env,
-    _subscribe_replay_info_request: JsSubscribeReplayInfoRequest,
-  ) -> napi::Result<PromiseRaw<'env, JsSubscribeReplayInfoResponse>> {
+    request_bytes: Buffer,
+  ) -> napi::Result<PromiseRaw<'env, Buffer>> {
+    let _request: SubscribeReplayInfoRequest =
+      decode_request(request_bytes, "SubscribeReplayInfoRequest")?;
     let mut client = self.client.clone();
 
     environment.spawn_future_with_callback(
@@ -294,21 +291,16 @@ impl GrpcClient {
           )
         })?;
 
-        Ok(protobuf_response)
+        Ok(protobuf_response.encode_to_vec())
       },
-      move |callback_environment, protobuf_response| {
-        JsSubscribeReplayInfoResponse::from_protobuf_to_js_type(
-          callback_environment,
-          protobuf_response,
-        )
-      },
+      move |_callback_environment, response_bytes| Ok(Buffer::from(response_bytes)),
     )
   }
 
   /// Creates a subscription stream bound to this client connection.
   ///
   /// The returned value is consumed by the JS SDK `ClientDuplexStream` wrapper,
-  /// which handles Node stream lifecycle and protobuf-shape normalization.
+  /// which handles Node stream lifecycle and protobuf payload decoding.
   //
   // subscribe should only be available via the `GrpcClient`
   #[allow(private_interfaces)]
@@ -316,8 +308,9 @@ impl GrpcClient {
   pub fn subscribe<'env>(
     &self,
     env: &'env napi::Env,
+    initial_request_bytes: Option<Buffer>,
   ) -> napi::Result<PromiseRaw<'env, crate::DuplexStream>> {
-    crate::DuplexStream::subscribe(env, self)
+    crate::DuplexStream::subscribe(env, self, initial_request_bytes)
   }
 
   /// Creates a deshred subscription stream bound to this client connection.

@@ -10,9 +10,93 @@ The minor version will be incremented upon a breaking change and the patch versi
 
 ## [Unreleased]
 
+## 2026-06-26
+
+- yellowstone-grpc-geyser 13.3.1
+
+### Misc
+
+- plugin: Optimize geyser_loop and block_reconstruction_loop, fixed double Slot notifications, fixed Block messages being delayed [#793](https://github.com/rpcpool/yellowstone-grpc/pull/793)
+
+## 2026-06-23
+
+- yellowstone-grpc-geyser 13.3.0
+
 ### Features
-- proto: add `CompressedAccountFilterSet` for sending compact account filters over the wire which works on both account and block subscriptions, with a `CuckooHashAlgorithm` enum so we can swap algorithms later without breaking old clients
-- geyser: integrate cuckoo matching into account and block filter paths
+
+- plugin: added `listen` configuration fields to replace `address` field that will become deprecated. [#773](https://github.com/rpcpool/yellowstone-grpc/pull/773)
+- plugin: supports `cert_dir` in geyser configuration [#773](https://github.com/rpcpool/yellowstone-grpc/pull/773), allowing you to load an HAPROXY-style certificate folder and do multi SNI certificate resolution for TLS connection.
+
+### Misc
+
+- plugin: Optimize filtering using `FoldHash` hash-based containers. [#774](https://github.com/rpcpool/yellowstone-grpc/pull/774)
+
+### Deprecated
+
+- plugin: `address` field in the `grpc` configuration. Use `listen` insteand.
+
+
+## 2026-06-17
+
+### Fixes
+
+- plugin: turns out block meta may arrive too early, even before all transaction for a given block have been emitted. We now buffer block meta and make sure the block can be sealed comparing transaction count from block meta.
+
+## 2026-06-16
+
+- yellowstone-grpc-geyser 13.2.4
+
+### Fixes
+
+- client: only quarantine slots pending replay verification, not live-sealed slots
+- plugin: changed order of sent messages to client such that block_meta arrives 1 index before block message
+
+## 2026-06-15
+
+- yellowstone-grpc-geyser 13.2.3
+
+### Fixes
+
+- client: auto-reconnect now quarantines replayed slots and compares blockhashes to handle the equivocation problem, preventing silent data loss when reconnecting to a node with different block content for the same slot.
+
+## 2026-06-03
+
+- yellowstone-grpc-geyser 13.2.1
+
+### misc
+
+- refactor finalized/confirmed delivery to stay outside the processed message loop in geyser_loop
+
+## 2026-06-02
+
+- yellowstone-grpc-geyser 13.2.0
+
+### misc
+
+- refactor block reconstruction
+
+## 2026-05-29
+
+- yellowstone-grpc-geyser 13.1.1
+
+### misc
+
+- geyser: enabled Jemalloc, optimize geyser event delivery timing and implemented eager flushing 
+Referenced PR(s) :[747](https://github.com/rpcpool/yellowstone-grpc/pull/747)
+
+### breaking
+
+- geyser: Removed parallel encoding. It performs 2x worse on transaction encoding and 10x worse on account encoding. The sync encoding function is still exposed in src/plugin/filter/encoder.rs.
+
+## 2026-05-13
+
+- yellowstone-grpc-geyser-13.1.0
+- yellowstone-grpc-client-13.1.0
+- yellowstone-grpc-proto-12.4.0
+
+### Features
+- proto: add `CompressedAccountFilterSet` for sending compact account filters over the wire which works on both account and block subscriptions, with a `CuckooHashAlgorithm` enum so we can swap algorithms later without breaking old clients ([#732](https://github.com/rpcpool/yellowstone-grpc/pull/732))
+- geyser: integrate cuckoo matching into account and block filter paths ([#732](https://github.com/rpcpool/yellowstone-grpc/pull/732))
 
 ## 2026-04-29
 

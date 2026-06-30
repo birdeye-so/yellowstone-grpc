@@ -2,20 +2,34 @@
 
 // Import generated gRPC client and types.
 import {
+  CuckooFilter as CuckooFilterMessage,
+  CuckooHashAlgorithm,
+  GetBlockHeightRequest as GetBlockHeightRequestMessage,
   GetBlockHeightResponse as GetBlockHeightResponseMessage,
+  GetLatestBlockhashRequest as GetLatestBlockhashRequestMessage,
   GetLatestBlockhashResponse as GetLatestBlockhashResponseMessage,
+  GetSlotRequest as GetSlotRequestMessage,
   GetSlotResponse as GetSlotResponseMessage,
+  GetVersionRequest as GetVersionRequestMessage,
   GetVersionResponse as GetVersionResponseMessage,
+  IsBlockhashValidRequest as IsBlockhashValidRequestMessage,
   IsBlockhashValidResponse as IsBlockhashValidResponseMessage,
+  PingRequest as PingRequestMessage,
   PongResponse as PongResponseMessage,
   SubscribeDeshredRequest as SubscribeDeshredRequestMessage,
   SubscribeRequest as SubscribeRequestMessage,
+  SubscribeRequestFilterAccounts as SubscribeRequestFilterAccountsMessage,
+  SubscribeRequestFilterBlocks as SubscribeRequestFilterBlocksMessage,
+  SubscribeReplayInfoRequest as SubscribeReplayInfoRequestMessage,
   SubscribeReplayInfoResponse as SubscribeReplayInfoResponseMessage,
+  SubscribeUpdate as SubscribeUpdateMessage,
+  SubscribeUpdateDeshred as SubscribeUpdateDeshredMessage,
   SubscribeUpdateDeshredTransactionInfo,
   SubscribeUpdateTransactionInfo,
 } from "./grpc/geyser";
 import type {
   CommitmentLevel,
+  CuckooFilter,
   GetBlockHeightResponse,
   GetLatestBlockhashResponse,
   GetSlotResponse,
@@ -25,6 +39,8 @@ import type {
   SubscribeDeshredRequest,
   SubscribeReplayInfoResponse,
   SubscribeRequest,
+  SubscribeRequestFilterAccounts,
+  SubscribeRequestFilterBlocks,
   SubscribeUpdateDeshred,
   SubscribeUpdate,
 } from "./grpc/geyser";
@@ -32,6 +48,8 @@ import type {
 // Reexport automatically generated types
 export {
   CommitmentLevel,
+  CuckooFilter,
+  CuckooHashAlgorithm,
   SubscribeDeshredRequest,
   SubscribeDeshredRequest_DeshredTransactionsEntry,
   SubscribeRequest,
@@ -75,6 +93,8 @@ import type {
 import { Duplex } from "stream";
 import * as napi from "./napi/index";
 
+export const AUTORECONNECT_FILTER_KEY: string = napi.AUTORECONNECT_FILTER_KEY;
+
 /**
  * Public channel options accepted by the SDK constructor.
  * This is sourced from the native N-API constructor signature to avoid
@@ -82,48 +102,24 @@ import * as napi from "./napi/index";
  */
 export type ChannelOptions = NonNullable<Parameters<typeof napi.GrpcClient.new>[2]>;
 
-/**
- * Convert N-API `JsSubscribeUpdate` shape (with `updateOneof`) into the
- * generated protobuf-friendly SDK shape (`SubscribeUpdate`) where the oneof
- * variants are top-level optional fields.
- */
-function fromJsSubscribeUpdate(update: napi.JsSubscribeUpdate): SubscribeUpdate {
-  const oneof = update.updateOneof ?? {};
-
-  return {
-    filters: update.filters ?? [],
-    createdAt: update.createdAt,
-    account: oneof.account as any,
-    slot: oneof.slot as any,
-    transaction: oneof.transaction as any,
-    transactionStatus: oneof.transactionStatus as any,
-    block: oneof.block as any,
-    ping: oneof.ping as any,
-    pong: oneof.pong as any,
-    blockMeta: oneof.blockMeta as any,
-    entry: oneof.entry as any,
-  } as SubscribeUpdate;
+export interface ReconnectOptions {
+  enabled?: boolean;
+  backoff?: {
+    initialIntervalMs?: number;
+    multiplier?: number;
+    maxRetries?: number;
+  };
+  slotRetention?: number;
 }
 
-/**
- * Convert N-API `JsSubscribeUpdateDeshred` shape (with `updateOneof`) into the
- * generated protobuf-friendly SDK shape (`SubscribeUpdateDeshred`).
- */
-function fromJsSubscribeUpdateDeshred(
-  update: napi.JsSubscribeUpdateDeshred,
-): SubscribeUpdateDeshred {
-  const oneof = update.updateOneof ?? {};
-
-  return {
-    filters: update.filters ?? [],
-    createdAt: update.createdAt,
-    deshredTransaction: oneof.deshredTransaction as any,
-    ping: oneof.ping as any,
-    pong: oneof.pong as any,
-  } as SubscribeUpdateDeshred;
+function isRecordObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function parseOptionalBool(value: unknown, fieldName: string): boolean | undefined {
+function parseStrictOptionalBool(
+  value: unknown,
+  fieldName: string,
+): boolean | undefined {
   if (value === undefined || value === null) {
     return undefined;
   }
@@ -132,57 +128,154 @@ function parseOptionalBool(value: unknown, fieldName: string): boolean | undefin
     return value;
   }
 
-  if (typeof value === "string") {
-    const normalized = value.trim().toLowerCase();
-    if (normalized === "true") {
-      return true;
-    }
-    if (normalized === "false") {
-      return false;
-    }
-  }
-
   throw new Error(
-    `Invalid ${fieldName}: expected true/false, got ${JSON.stringify(value)}`,
+    `Invalid ${fieldName}: expected true/false boolean, got ${JSON.stringify(value)}`,
   );
 }
 
 function normalizeSubscribeDeshredRequest(
   request: SubscribeDeshredRequest,
 ): SubscribeDeshredRequest {
-  const normalizedEntries = Object.fromEntries(
-    Object.entries(request.deshredTransactions ?? {}).map(([name, filter]) => [
-      name,
-      {
-        ...filter,
-        vote: parseOptionalBool(
-          (filter as { vote?: unknown }).vote,
-          `deshredTransactions.${name}.vote`,
-        ),
-      },
-    ]),
-  );
+  if (!isRecordObject(request)) {
+    throw new Error("Invalid subscribeDeshred request: expected object");
+  }
+
+  const deshredTransactions = (
+    request as { deshredTransactions?: unknown }
+  ).deshredTransactions;
+  if (!isRecordObject(deshredTransactions)) {
+    throw new Error("Invalid deshredTransactions: expected object");
+  }
+
+  const slots = (request as { slots?: unknown }).slots;
+  if (!isRecordObject(slots)) {
+    throw new Error("Invalid slots: expected object");
+  }
+
+  const normalizedEntries: SubscribeDeshredRequest["deshredTransactions"] = {};
+  for (const [name, filter] of Object.entries(deshredTransactions)) {
+    if (!isRecordObject(filter)) {
+      throw new Error(`Invalid deshredTransactions.${name}: expected object`);
+    }
+
+    normalizedEntries[name] = {
+      ...(filter as unknown as SubscribeDeshredRequest["deshredTransactions"][string]),
+      vote: parseStrictOptionalBool(
+        (filter as { vote?: unknown }).vote,
+        `deshredTransactions.${name}.vote`,
+      ),
+    };
+  }
 
   return {
     ...request,
     deshredTransactions: normalizedEntries,
+    slots: slots as SubscribeDeshredRequest["slots"],
   };
+}
+
+export type PubkeyInput = string | Uint8Array;
+
+function pubkeyInputToBuffer(pubkey: Uint8Array): Buffer {
+  return Buffer.from(pubkey);
+}
+
+function validateCuckooCapacity(maxCapacity: number): void {
+  if (
+    !Number.isSafeInteger(maxCapacity) ||
+    maxCapacity < 0 ||
+    maxCapacity > 0xffffffff
+  ) {
+    throw new Error(
+      "Invalid maxCapacity: expected an integer between 0 and 4294967295",
+    );
+  }
+}
+
+export class CompressedAccountFilterSet {
+  private _native: napi.CompressedAccountFilterSet;
+
+  constructor(maxCapacity: number) {
+    validateCuckooCapacity(maxCapacity);
+    this._native = new napi.CompressedAccountFilterSet(maxCapacity);
+  }
+
+  insert(pubkey: PubkeyInput): boolean {
+    return typeof pubkey === "string"
+      ? this._native.insert(pubkey)
+      : this._native.insertBytes(pubkeyInputToBuffer(pubkey));
+  }
+
+  remove(pubkey: PubkeyInput): boolean {
+    return typeof pubkey === "string"
+      ? this._native.remove(pubkey)
+      : this._native.removeBytes(pubkeyInputToBuffer(pubkey));
+  }
+
+  contains(pubkey: PubkeyInput): boolean {
+    return typeof pubkey === "string"
+      ? this._native.contains(pubkey)
+      : this._native.containsBytes(pubkeyInputToBuffer(pubkey));
+  }
+
+  len(): number {
+    return this._native.len();
+  }
+
+  capacity(): number {
+    return this._native.capacity();
+  }
+
+  isEmpty(): boolean {
+    return this._native.isEmpty();
+  }
+
+  toProto(): CuckooFilter {
+    return CuckooFilterMessage.decode(
+      this._native.toProto() as unknown as Uint8Array,
+    );
+  }
+
+  toAccountFilter(): SubscribeRequestFilterAccounts {
+    return SubscribeRequestFilterAccountsMessage.decode(
+      this._native.toAccountFilter() as unknown as Uint8Array,
+    );
+  }
+
+  toBlockFilter(): SubscribeRequestFilterBlocks {
+    return SubscribeRequestFilterBlocksMessage.decode(
+      this._native.toBlockFilter() as unknown as Uint8Array,
+    );
+  }
+
+  insertIntoSubscribeRequest(request: SubscribeRequest, name: string): void {
+    request.accounts ??= {};
+    request.accounts[name] = this.toAccountFilter();
+  }
+
+  insertIntoBlockSubscribeRequest(request: SubscribeRequest, name: string): void {
+    request.blocks ??= {};
+    request.blocks[name] = this.toBlockFilter();
+  }
 }
 
 export default class Client {
   private _insecureEndpoint: string;
   private _insecureXToken: string | undefined;
   private _channelOptions: ChannelOptions | undefined;
+  private _reconnectOptions: ReconnectOptions | undefined;
   private _grpcClient: unknown | null = null;
 
   constructor(
     endpoint: string,
     xToken: string | undefined,
     channel_options: ChannelOptions | undefined,
+    reconnect_options?: ReconnectOptions,
   ) {
     this._insecureEndpoint = endpoint;
     this._insecureXToken = xToken;
     this._channelOptions = channel_options;
+    this._reconnectOptions = reconnect_options;
   }
 
   private _connectedGrpcClient(): napi.GrpcClient {
@@ -198,6 +291,7 @@ export default class Client {
       this._insecureEndpoint,
       this._insecureXToken,
       this._channelOptions,
+      this._reconnectOptions,
     );
   }
 
@@ -206,55 +300,41 @@ export default class Client {
   ): Promise<GetLatestBlockhashResponse> {
     const grpcClient = this._connectedGrpcClient();
 
-    const request: napi.JsGetLatestBlockhashRequest = {
-      commitment: commitment ?? null,
-    };
-
-    const response = await grpcClient.getLatestBlockhash(request);
-    return GetLatestBlockhashResponseMessage.fromPartial({
-      slot: response.slot,
-      blockhash: response.blockhash,
-      lastValidBlockHeight: response.lastValidBlockHeight,
-    });
+    const request = GetLatestBlockhashRequestMessage.fromPartial({ commitment });
+    const response = await grpcClient.getLatestBlockhash(
+      Buffer.from(GetLatestBlockhashRequestMessage.encode(request).finish()),
+    );
+    return GetLatestBlockhashResponseMessage.decode(response);
   }
 
   async ping(count: number): Promise<PongResponse> {
     const grpcClient = this._connectedGrpcClient();
 
-    const request: napi.JsPingRequest = {
-      count,
-    };
-
-    const response = await grpcClient.ping(request);
-    return PongResponseMessage.fromPartial({
-      count: response.count,
-    });
+    const request = PingRequestMessage.fromPartial({ count });
+    const response = await grpcClient.ping(
+      Buffer.from(PingRequestMessage.encode(request).finish()),
+    );
+    return PongResponseMessage.decode(response);
   }
 
   async getBlockHeight(commitment?: CommitmentLevel): Promise<GetBlockHeightResponse> {
     const grpcClient = this._connectedGrpcClient();
 
-    const request: napi.JsGetBlockHeightRequest = {
-      commitment,
-    };
-
-    const response = await grpcClient.getBlockHeight(request);
-    return GetBlockHeightResponseMessage.fromPartial({
-      blockHeight: response.blockHeight,
-    });
+    const request = GetBlockHeightRequestMessage.fromPartial({ commitment });
+    const response = await grpcClient.getBlockHeight(
+      Buffer.from(GetBlockHeightRequestMessage.encode(request).finish()),
+    );
+    return GetBlockHeightResponseMessage.decode(response);
   }
 
   async getSlot(commitment?: CommitmentLevel): Promise<GetSlotResponse> {
     const grpcClient = this._connectedGrpcClient();
 
-    const request: napi.JsGetSlotRequest = {
-      commitment,
-    };
-
-    const response = await grpcClient.getSlot(request);
-    return GetSlotResponseMessage.fromPartial({
-      slot: response.slot,
-    });
+    const request = GetSlotRequestMessage.fromPartial({ commitment });
+    const response = await grpcClient.getSlot(
+      Buffer.from(GetSlotRequestMessage.encode(request).finish()),
+    );
+    return GetSlotResponseMessage.decode(response);
   }
 
   async isBlockhashValid(
@@ -263,41 +343,38 @@ export default class Client {
   ): Promise<IsBlockhashValidResponse> {
     const grpcClient = this._connectedGrpcClient();
 
-    const request: napi.JsIsBlockhashValidRequest = {
+    const request = IsBlockhashValidRequestMessage.fromPartial({
       blockhash,
       commitment,
-    };
-
-    const response = await grpcClient.isBlockhashValid(request);
-    return IsBlockhashValidResponseMessage.fromPartial({
-      slot: response.slot,
-      valid: response.valid,
     });
+
+    const response = await grpcClient.isBlockhashValid(
+      Buffer.from(IsBlockhashValidRequestMessage.encode(request).finish()),
+    );
+    return IsBlockhashValidResponseMessage.decode(response);
   }
 
   async getVersion(): Promise<GetVersionResponse> {
     const grpcClient = this._connectedGrpcClient();
 
-    const request: napi.JsGetVersionRequest = {};
-
-    const response = await grpcClient.getVersion(request);
-    return GetVersionResponseMessage.fromPartial({
-      version: response.version,
-    });
+    const request = GetVersionRequestMessage.fromPartial({});
+    const response = await grpcClient.getVersion(
+      Buffer.from(GetVersionRequestMessage.encode(request).finish()),
+    );
+    return GetVersionResponseMessage.decode(response);
   }
 
   async subscribeReplayInfo(): Promise<SubscribeReplayInfoResponse> {
     const grpcClient = this._connectedGrpcClient();
 
-    const request: napi.JsSubscribeReplayInfoRequest = {};
-
-    const response = await grpcClient.subscribeReplayInfo(request);
-    return SubscribeReplayInfoResponseMessage.fromPartial({
-      firstAvailable: response.firstAvailable,
-    });
+    const request = SubscribeReplayInfoRequestMessage.fromPartial({});
+    const response = await grpcClient.subscribeReplayInfo(
+      Buffer.from(SubscribeReplayInfoRequestMessage.encode(request).finish()),
+    );
+    return SubscribeReplayInfoResponseMessage.decode(response);
   }
 
-  async subscribe(): Promise<ClientDuplexStream> {
+  async subscribe(request?: SubscribeRequest): Promise<ClientDuplexStream> {
     const grpcClient = this._connectedGrpcClient();
 
     // Inner stream.Duplex config passed to both stream.Readable and Writable.
@@ -311,9 +388,14 @@ export default class Client {
       // highWaterMark: 16
     };
 
-    // Native stream produces N-API generated JS objects; wrapper below adapts
+    // Native stream produces protobuf payload bytes; wrapper below decodes them
     // to public protobuf-generated SDK shapes and Node stream semantics.
-    const stream = await grpcClient.subscribe();
+    const stream =
+      request === undefined
+        ? await grpcClient.subscribe()
+        : await grpcClient.subscribe(
+            Buffer.from(SubscribeRequestMessage.encode(request).finish()),
+          );
 
     return new Promise<ClientDuplexStream>((resolve, reject) => {
       try {
@@ -378,7 +460,9 @@ export class ClientDuplexStream extends Duplex {
 
     this._readInFlight = true;
 
-    (this._napiDuplexStream as napi.DuplexStream)
+    (this._napiDuplexStream as {
+      read: () => Promise<Uint8Array | undefined | null>;
+    })
       .read()
       .then((update) => {
         this._readInFlight = false;
@@ -394,7 +478,7 @@ export class ClientDuplexStream extends Duplex {
           return;
         }
 
-        const grpcUpdate = fromJsSubscribeUpdate(update);
+        const grpcUpdate = SubscribeUpdateMessage.decode(update);
 
         // Respect backpressure: only pull again if consumer accepted push.
         const canContinue = this.push(grpcUpdate);
@@ -510,7 +594,7 @@ export class ClientDeshredDuplexStream extends Duplex {
     this._readInFlight = true;
 
     (this._napiDuplexStream as {
-      read: () => Promise<napi.JsSubscribeUpdateDeshred | undefined | null>;
+      read: () => Promise<Uint8Array | undefined | null>;
     })
       .read()
       .then((update) => {
@@ -526,7 +610,7 @@ export class ClientDeshredDuplexStream extends Duplex {
           return;
         }
 
-        const grpcUpdate = fromJsSubscribeUpdateDeshred(update);
+        const grpcUpdate = SubscribeUpdateDeshredMessage.decode(update);
 
         const canContinue = this.push(grpcUpdate);
         if (canContinue) {

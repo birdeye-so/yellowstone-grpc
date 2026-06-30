@@ -1,73 +1,84 @@
 use {
     crate::{
-        config::{ConfigGrpc, GrpcAddress},
-        metered::MeteredLayer,
+        block_reconstruction::BlockMachineStorage,
+        config::{ConfigGrpc, GrpcAddress, GrpcTlsConfig},
+        metered::PrometheusMeteredManager,
         metrics::{
             self, incr_grpc_method_call_count, set_subscriber_queue_size,
             subscription_limit_exceeded_inc, DebugClientMessage, GEYSER_BATCH_SIZE,
         },
-        parallel::ParallelEncoder,
         plugin::{
             filter::{
+                encoder::encode_messages,
                 limits::FilterLimits,
                 message::{FilteredUpdate, FilteredUpdateOneof},
                 name::FilterNames,
                 Filter,
             },
-            message::{
-                CommitmentLevel, Message, MessageBlock, MessageBlockMeta, MessageEntry,
-                MessageSlot, MessageTransactionInfo, SlotStatus,
-            },
+            message::{CommitmentLevel, Message, MessageBlockMeta, MessageSlot, SlotStatus},
             proto::geyser_server::{Geyser, GeyserServer},
         },
-        transport::{SpyIncoming, SpyIncomingConfig, DEFAULT_TRAFFIC_REPORTING_THRESHOLD},
+        ratelimit::PrometheusRatelimitCallbacks,
         util::stream::{load_aware_channel, LoadAwareReceiver, LoadAwareSender},
         version::GrpcVersionInfo,
     },
-    anyhow::Context,
+    anyhow::Context as _,
     bytesize::ByteSize,
+    futures::Stream,
     log::{error, info},
     prost_types::Timestamp,
+    rustls::{
+        pki_types::{pem::PemObject, PrivateKeyDer},
+        ServerConfig,
+    },
     solana_clock::{Slot, MAX_RECENT_BLOCKHASHES},
-    solana_pubkey::Pubkey,
     std::{
-        collections::{BTreeMap, HashMap},
+        collections::HashMap,
+        io,
         net::SocketAddr,
         os::unix::fs::PermissionsExt,
         path::PathBuf,
+        pin::Pin,
         sync::{
             atomic::{AtomicU64, AtomicUsize, Ordering},
             Arc, LazyLock, Mutex as StdMutex,
         },
+        task::{Context, Poll},
         time::SystemTime,
     },
     tokio::{
-        fs,
+        io::{AsyncRead, AsyncWrite},
         net::UnixListener,
         sync::{broadcast, mpsc, oneshot, Mutex, RwLock, Semaphore},
-        time::{sleep, Duration, Instant},
+        time::{sleep, Duration},
     },
+    tokio_rustls::{rustls, TlsAcceptor},
     tokio_stream::wrappers::UnixListenerStream,
     tokio_util::{sync::CancellationToken, task::TaskTracker},
     tonic::{
         metadata::AsciiMetadataValue,
         service::interceptor,
         transport::{
-            server::{Server, TcpConnectInfo, TcpIncoming, TlsConnectInfo},
-            Identity, ServerTlsConfig,
+            server::{Connected, Server, TcpConnectInfo, TlsConnectInfo},
+            CertificateDer,
         },
         Request, Response, Result as TonicResult, Status, Streaming,
     },
     tonic_health::{pb::health_server::HealthServer, server::health_reporter},
-    yellowstone_grpc_proto::{
-        prelude::{
-            CommitmentLevel as CommitmentLevelProto, GetBlockHeightRequest, GetBlockHeightResponse,
-            GetLatestBlockhashRequest, GetLatestBlockhashResponse, GetSlotRequest, GetSlotResponse,
-            GetVersionRequest, GetVersionResponse, IsBlockhashValidRequest,
-            IsBlockhashValidResponse, PingRequest, PongResponse, SubscribeDeshredRequest,
-            SubscribeReplayInfoRequest, SubscribeReplayInfoResponse, SubscribeRequest,
+    yellowstone_grpc_proto::prelude::{
+        CommitmentLevel as CommitmentLevelProto, GetBlockHeightRequest, GetBlockHeightResponse,
+        GetLatestBlockhashRequest, GetLatestBlockhashResponse, GetSlotRequest, GetSlotResponse,
+        GetVersionRequest, GetVersionResponse, IsBlockhashValidRequest, IsBlockhashValidResponse,
+        PingRequest, PongResponse, SubscribeDeshredRequest, SubscribeReplayInfoRequest,
+        SubscribeReplayInfoResponse, SubscribeRequest,
+    },
+    yellowstone_grpc_tools::server::{
+        tcp::{TcpConfiguration, TcpIncoming as TritonTcpIncoming},
+        tls::{build_sni_resolver_from_cert_dir, HotResolvesServerCertUsingSni, TlsIncoming},
+        tonic::{
+            metered::{MeteredBandwidthLayer, DEFAULT_TRAFFIC_REPORTING_THRESHOLD},
+            ratelimit::transport::{RateLimitedIncoming, SharedRateLimitTable},
         },
-        prost::Message as ProstMessage,
     },
 };
 
@@ -113,87 +124,98 @@ impl BlockMetaStorage {
     ) -> (Self, mpsc::UnboundedSender<Message>) {
         let inner = Arc::new(RwLock::new(BlockMetaStorageInner::default()));
         let (tx, mut rx) = mpsc::unbounded_channel();
-
         let storage = Arc::clone(&inner);
-        task_tracker.spawn(async move {
-            const KEEP_SLOTS: u64 = 3;
+        let completion_token = task_tracker.token();
+        let _ = std::thread::Builder::new()
+            .name("solGrpcBlockMetaStorage".to_string())
+            .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create Tokio runtime for BlockMetaStorage");   
 
-            loop {
-                tokio::select! {
-                    _ = cancellation_token.cancelled() => {
-                        info!("BlockMetaStorage task cancelled");
-                        break;
-                    },
-                    maybe = rx.recv() => {
-                        let Some(message) = maybe else {
-                            info!("BlockMetaStorage channel closed");
+            runtime.block_on(async move {
+                const KEEP_SLOTS: u64 = 3;
+
+                loop {
+                    tokio::select! {
+                        _ = cancellation_token.cancelled() => {
+                            info!("BlockMetaStorage task cancelled");
                             break;
-                        };
-                        let mut storage = storage.write().await;
-                        match message {
-                            Message::Slot(msg) => {
-                                match msg.status {
-                                    SlotStatus::Processed => {
-                                        storage.processed.replace(msg.slot);
-                                    }
-                                    SlotStatus::Confirmed => {
-                                        storage.confirmed.replace(msg.slot);
-                                    }
-                                    SlotStatus::Finalized => {
-                                        storage.finalized.replace(msg.slot);
-                                    }
-                                    _ => {}
-                                }
-
-                                if let Some(blockhash) = storage
-                                    .blocks
-                                    .get(&msg.slot)
-                                    .map(|block| block.blockhash.clone())
-                                {
-                                    let entry = storage
-                                        .blockhashes
-                                        .entry(blockhash)
-                                        .or_insert_with(|| BlockhashStatus::new(msg.slot));
-
+                        },
+                        maybe = rx.recv() => {
+                            let Some(message) = maybe else {
+                                info!("BlockMetaStorage channel closed");
+                                break;
+                            };
+                            let mut storage = storage.write().await;
+                            match message {
+                                Message::Slot(msg) => {
                                     match msg.status {
                                         SlotStatus::Processed => {
-                                            entry.processed = true;
+                                            storage.processed.replace(msg.slot);
                                         }
                                         SlotStatus::Confirmed => {
-                                            entry.confirmed = true;
+                                            storage.confirmed.replace(msg.slot);
                                         }
                                         SlotStatus::Finalized => {
-                                            entry.finalized = true;
+                                            storage.finalized.replace(msg.slot);
                                         }
                                         _ => {}
                                     }
-                                }
 
-                                if msg.status == SlotStatus::Finalized {
-                                    if let Some(keep_slot) = msg.slot.checked_sub(KEEP_SLOTS) {
-                                        storage.blocks.retain(|slot, _block| *slot >= keep_slot);
-                                    }
-
-                                    if let Some(keep_slot) =
-                                        msg.slot.checked_sub(MAX_RECENT_BLOCKHASHES as u64 + 32)
+                                    if let Some(blockhash) = storage
+                                        .blocks
+                                        .get(&msg.slot)
+                                        .map(|block| block.blockhash.clone())
                                     {
-                                        storage
+                                        let entry = storage
                                             .blockhashes
-                                            .retain(|_blockhash, status| status.slot >= keep_slot);
+                                            .entry(blockhash)
+                                            .or_insert_with(|| BlockhashStatus::new(msg.slot));
+
+                                        match msg.status {
+                                            SlotStatus::Processed => {
+                                                entry.processed = true;
+                                            }
+                                            SlotStatus::Confirmed => {
+                                                entry.confirmed = true;
+                                            }
+                                            SlotStatus::Finalized => {
+                                                entry.finalized = true;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+
+                                    if msg.status == SlotStatus::Finalized {
+                                        if let Some(keep_slot) = msg.slot.checked_sub(KEEP_SLOTS) {
+                                            storage.blocks.retain(|slot, _block| *slot >= keep_slot);
+                                        }
+
+                                        if let Some(keep_slot) =
+                                            msg.slot.checked_sub(MAX_RECENT_BLOCKHASHES as u64 + 32)
+                                        {
+                                            storage
+                                                .blockhashes
+                                                .retain(|_blockhash, status| status.slot >= keep_slot);
+                                        }
                                     }
                                 }
-                            }
-                            Message::BlockMeta(msg) => {
-                                storage.blocks.insert(msg.slot, msg);
-                            }
-                            msg => {
-                                error!("invalid message in BlockMetaStorage: {msg:?}");
+                                Message::BlockMeta(msg) => {
+                                    storage.blocks.insert(msg.slot, msg);
+                                }
+                                msg => {
+                                    error!("invalid message in BlockMetaStorage: {msg:?}");
+                                }
                             }
                         }
                     }
                 }
-            }
-            info!("BlockMetaStorage task exiting");
+                info!("BlockMetaStorage task exiting");
+            });
+
+            drop(completion_token);
         });
 
         (
@@ -276,84 +298,10 @@ impl BlockMetaStorage {
     }
 }
 
-#[derive(Debug, Default)]
-struct MessageId {
-    id: u64,
-}
-
-impl MessageId {
-    const fn next(&mut self) -> u64 {
-        self.id = self.id.checked_add(1).expect("message id overflow");
-        self.id
-    }
-}
-
-#[derive(Debug, Default)]
-struct SlotMessages {
-    messages: Vec<Option<(u64, Message)>>, // Option is used for accounts with low write_version
-    messages_slots: Vec<(u64, Message)>,
-    block_meta: Option<Arc<MessageBlockMeta>>,
-    transactions: Vec<Arc<MessageTransactionInfo>>,
-    accounts_dedup: HashMap<Pubkey, (u64, usize)>, // (write_version, message_index)
-    entries: Vec<Arc<MessageEntry>>,
-    sealed: bool,
-    entries_count: usize,
-    confirmed_at: Option<usize>,
-    finalized_at: Option<usize>,
-    parent_slot: Option<Slot>,
-    confirmed: bool,
-    finalized: bool,
-}
-
-impl SlotMessages {
-    pub fn try_seal(&mut self, msgid_gen: &mut MessageId) -> Option<(u64, Message)> {
-        if !self.sealed {
-            if let Some(block_meta) = &self.block_meta {
-                let executed_transaction_count = block_meta.executed_transaction_count as usize;
-                let entries_count = block_meta.entries_count as usize;
-
-                // Additional check `entries_count == 0` due to bug of zero entries on block produced by validator
-                // See GitHub issue: https://github.com/solana-labs/solana/issues/33823
-                if self.transactions.len() == executed_transaction_count
-                    && (entries_count == 0 || self.entries.len() == entries_count)
-                {
-                    let transactions = std::mem::take(&mut self.transactions);
-                    let mut entries = std::mem::take(&mut self.entries);
-                    if entries_count == 0 {
-                        entries.clear();
-                    }
-
-                    let mut accounts = Vec::with_capacity(self.messages.len());
-                    for item in self.messages.iter().flatten() {
-                        if let (_msgid, Message::Account(account)) = item {
-                            accounts.push(Arc::clone(&account.account));
-                        }
-                    }
-
-                    let message_block = Message::Block(Arc::new(MessageBlock::new(
-                        Arc::clone(block_meta),
-                        transactions,
-                        accounts,
-                        entries,
-                    )));
-                    let message = (msgid_gen.next(), message_block);
-                    self.messages.push(Some(message.clone()));
-
-                    self.sealed = true;
-                    self.entries_count = entries_count;
-                    return Some(message);
-                }
-            }
-        }
-
-        None
-    }
-}
-
-type BroadcastedMessage = (CommitmentLevel, Arc<Vec<(u64, Message)>>);
+type BroadcastedMessage = (CommitmentLevel, Arc<Vec<Message>>);
 
 enum ReplayedResponse {
-    Messages(Vec<(u64, Message)>),
+    Messages(Vec<Message>),
     Lagged(Slot),
 }
 
@@ -494,9 +442,43 @@ impl Drop for ClientSession {
     }
 }
 
+struct AutoClosableUnixListenerStream {
+    path_to_remove: PathBuf,
+    listener: UnixListenerStream,
+}
+
+impl Stream for AutoClosableUnixListenerStream {
+    type Item = io::Result<tokio::net::UnixStream>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.listener).poll_next(cx) {
+            Poll::Ready(Some(Ok(stream))) => Poll::Ready(Some(Ok(stream))),
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for AutoClosableUnixListenerStream {
+    fn drop(&mut self) {
+        if let Err(err) = std::fs::remove_file(&self.path_to_remove) {
+            error!(
+                "failed to remove Unix socket file {}: {}",
+                self.path_to_remove.display(),
+                err
+            );
+        } else {
+            info!("removed Unix socket file {}", self.path_to_remove.display());
+        }
+    }
+}
+
 enum Listener {
-    Tcp(TcpIncoming),
-    Unix(PathBuf, UnixListenerStream), // path needed to remove the socket file on exit
+    Tcp(TritonTcpIncoming),
+    Tls(TlsIncoming),
+    Unix(AutoClosableUnixListenerStream), // path needed to remove the socket file on exit
 }
 
 #[derive(Clone)]
@@ -532,9 +514,54 @@ pub struct GrpcService {
     replay_stored_slots_tx: Option<mpsc::Sender<ReplayStoredSlotsRequest>>,
     replay_first_available_slot: Option<Arc<AtomicU64>>,
     debug_clients_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
-    filter_names: Arc<Mutex<FilterNames>>,
     cancellation_token: CancellationToken,
     task_tracker: TaskTracker,
+    filter_name_size_limit: usize,
+    filter_names_size_limit: usize,
+    filter_names_cleanup_interval: Duration,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TlsConfigLoadError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Rustls(#[from] rustls::Error),
+    #[error(transparent)]
+    PemError(#[from] rustls::pki_types::pem::Error),
+}
+
+///
+/// Loads TLS server configuration from the given `GrpcTlsConfig`. This is used for both the legacy `tls_config` field and the new `listen[].tls` field in the configuration. The `listen[].tls` field takes precedence over the legacy `tls_config` if both are set.
+///
+fn load_server_config_from_tls_config(
+    tls_config: &GrpcTlsConfig,
+) -> Result<ServerConfig, TlsConfigLoadError> {
+    match tls_config {
+        GrpcTlsConfig::IdentityPair { identity } => {
+            let cert_pem = std::fs::read(&identity.cert_path)?;
+            let key = std::fs::read(&identity.key_path)?;
+
+            let cert_der = CertificateDer::from_pem_slice(&cert_pem)?;
+            let key_der = PrivateKeyDer::from_pem_slice(&key)?;
+            let mut server_config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der], key_der)?;
+            // gRPC over TLS requires ALPN negotiation for HTTP/2.
+            server_config.alpn_protocols = vec![b"h2".to_vec()];
+            Ok(server_config)
+        }
+        GrpcTlsConfig::CertDir { cert_dir } => {
+            let resolver = build_sni_resolver_from_cert_dir(cert_dir.clone())?;
+            let hot_resolver = HotResolvesServerCertUsingSni::from(resolver);
+            let mut server_config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(hot_resolver));
+            // gRPC over TLS requires ALPN negotiation for HTTP/2.
+            server_config.alpn_protocols = vec![b"h2".to_vec()];
+            Ok(server_config)
+        }
+    }
 }
 
 impl GrpcService {
@@ -545,39 +572,153 @@ impl GrpcService {
         is_reload: bool,
         service_cancellation_token: CancellationToken,
         task_tracker: TaskTracker,
-        parallel_encoder: ParallelEncoder,
     ) -> anyhow::Result<(
         Option<crossbeam_channel::Sender<Box<Message>>>,
         mpsc::UnboundedSender<Message>,
     )> {
         // Bind all configured addresses (TCP or Unix domain socket)
         let mut listeners = Vec::new();
-        for addr in &config.address.inner {
-            let listener = match addr {
-                GrpcAddress::Tcp(addr) => {
-                    let incoming = TcpIncoming::bind(*addr)?
-                        .with_nodelay(Some(true))
-                        .with_keepalive(Some(Duration::from_secs(20)));
-                    Listener::Tcp(incoming)
-                }
-                GrpcAddress::Unix { path, mode } => {
-                    if config.tls_config.is_some() {
-                        log::warn!(
-                            "TLS config is ignored for Unix domain socket: {}",
+
+        // This is the LEGACY way of configuring the listen address, which is still supported for backward compatibility but will be removed in the future. The new way is to use the `listen` field which supports multiple addresses and TLS configuration per address.
+        if let Some(addresses) = config.address.clone() {
+            log::warn!("The 'address' field is deprecated; please use the 'listen' field with an array of addresses instead");
+            if config.tls_config.is_some() && config.cert_dir.is_some() {
+                log::warn!("Both tls_config and cert_dir are set; cert_dir will take precedence and tls_config will be ignored");
+            }
+            let mut maybe_tls_server_config = if let Some(tls) = &config.tls_config {
+                let cert_pem = std::fs::read(&tls.cert_path)
+                    .context("failed to read TLS cert file")
+                    .unwrap();
+                let key = std::fs::read(&tls.key_path)
+                    .context("failed to read TLS key file")
+                    .unwrap();
+
+                let cert_der =
+                    CertificateDer::from_pem_slice(&cert_pem).context("tls cert_path")?;
+                let key_der = PrivateKeyDer::from_pem_slice(&key).context("tls key_path")?;
+                let mut server_config = ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(vec![cert_der], key_der)?;
+                // gRPC over TLS requires ALPN negotiation for HTTP/2.
+                server_config.alpn_protocols = vec![b"h2".to_vec()];
+                Some(server_config)
+            } else {
+                None
+            };
+
+            // Cert-dir has precedence over tls_config if both are set.
+            // TODO: supports hot reload via sighub signal and watching cert_dir changes
+            if let Some(cert_dir) = &config.cert_dir {
+                let resolver = build_sni_resolver_from_cert_dir(cert_dir.clone())?;
+                let hot_resolver = HotResolvesServerCertUsingSni::from(resolver);
+                let mut server_config = ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_cert_resolver(Arc::new(hot_resolver));
+                // gRPC over TLS requires ALPN negotiation for HTTP/2.
+                server_config.alpn_protocols = vec![b"h2".to_vec()];
+                let _ = maybe_tls_server_config.replace(server_config);
+            }
+
+            log::warn!("The 'address' field is deprecated; please use the 'listen' field with an array of addresses instead");
+            for address in addresses {
+                match address {
+                    GrpcAddress::Tcp(addr) => {
+                        let incoming = TritonTcpIncoming::bind_with_config(
+                            addr,
+                            TcpConfiguration::default()
+                                .with_nodelay(Some(true))
+                                .with_keepalive(Some(Duration::from_secs(20))),
+                        )
+                        .await?;
+                        log::info!(
+                            "binding gRPC server to TCP socket: {}",
+                            incoming.local_addr()?
+                        );
+                        listeners.push(Listener::Tcp(incoming));
+                    }
+                    GrpcAddress::Unix { path, mode } => {
+                        if config.tls_config.is_some() || config.cert_dir.is_some() {
+                            log::warn!(
+                                "TLS config is ignored for Unix domain socket: {}",
+                                path.display()
+                            );
+                        }
+                        if let Err(e) = std::fs::remove_file(&path) {
+                            if e.kind() != std::io::ErrorKind::NotFound {
+                                return Err(e.into());
+                            }
+                        }
+                        log::info!(
+                            "binding gRPC server to Unix domain socket: {}",
                             path.display()
                         );
+                        let uds = UnixListener::bind(&path)?;
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+                        let uds = UnixListenerStream::new(uds);
+                        let uds = AutoClosableUnixListenerStream {
+                            path_to_remove: path,
+                            listener: uds,
+                        };
+                        listeners.push(Listener::Unix(uds));
                     }
-                    if let Err(e) = std::fs::remove_file(path) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            return Err(e.into());
-                        }
-                    }
-                    let uds = UnixListener::bind(path)?;
-                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode))?;
-                    Listener::Unix(path.clone(), UnixListenerStream::new(uds))
                 }
-            };
-            listeners.push(listener);
+            }
+        }
+
+        if let Some(listen_configs) = config.listen.clone() {
+            for listen_config in listen_configs {
+                let address = listen_config.address;
+                let tls_config = listen_config.tls;
+                match address {
+                    GrpcAddress::Tcp(addr) => {
+                        let incoming = TritonTcpIncoming::bind_with_config(
+                            addr,
+                            TcpConfiguration::default()
+                                .with_nodelay(Some(true))
+                                .with_keepalive(Some(Duration::from_secs(20))),
+                        )
+                        .await?;
+                        log::info!(
+                            "binding gRPC server to TCP socket: {}",
+                            incoming.local_addr()?
+                        );
+                        let listener = if let Some(tls) = tls_config {
+                            let server_config = load_server_config_from_tls_config(&tls)
+                                .context("failed to load TLS server config")?;
+                            let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
+                            Listener::Tls(TlsIncoming::new(incoming, tls_acceptor))
+                        } else {
+                            Listener::Tcp(incoming)
+                        };
+                        listeners.push(listener);
+                    }
+                    GrpcAddress::Unix { path, mode } => {
+                        if tls_config.is_some() {
+                            log::warn!(
+                                "TLS config is ignored for Unix domain socket: {}",
+                                path.display()
+                            );
+                        }
+                        if let Err(e) = std::fs::remove_file(&path) {
+                            if e.kind() != std::io::ErrorKind::NotFound {
+                                return Err(e.into());
+                            }
+                        }
+                        log::info!(
+                            "binding gRPC server to Unix domain socket: {}",
+                            path.display()
+                        );
+                        let uds = UnixListener::bind(&path)?;
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+                        let uds = UnixListenerStream::new(uds);
+                        let uds = AutoClosableUnixListenerStream {
+                            path_to_remove: path,
+                            listener: uds,
+                        };
+                        listeners.push(Listener::Unix(uds));
+                    }
+                }
+            }
         }
 
         // Snapshot channel
@@ -611,21 +752,10 @@ impl GrpcService {
                 (Some(Arc::new(AtomicU64::new(u64::MAX))), Some(tx), Some(rx))
             };
 
-        // Read TLS identity once (async, before per-listener loop)
-        let tls_identity = match &config.tls_config {
-            Some(tls) => {
-                let (cert, key) =
-                    tokio::try_join!(fs::read(&tls.cert_path), fs::read(&tls.key_path))
-                        .context("failed to load tls_config files")?;
-                Some(Identity::from_pem(cert, key))
-            }
-            None => None,
-        };
-
         // Capture traffic reporting threshold before config is moved
         let traffic_reporting_threshold = config
             .traffic_reporting_byte_threhsold
-            .unwrap_or_else(|| ByteSize::b(DEFAULT_TRAFFIC_REPORTING_THRESHOLD));
+            .unwrap_or(DEFAULT_TRAFFIC_REPORTING_THRESHOLD);
 
         // Save HTTP/2 settings (all Copy) for use inside spawned tasks
         let http2_adaptive_window = config.server_http2_adaptive_window;
@@ -633,12 +763,6 @@ impl GrpcService {
         let http2_keepalive_timeout = config.server_http2_keepalive_timeout;
         let initial_connection_window_size = config.server_initial_connection_window_size;
         let initial_stream_window_size = config.server_initial_stream_window_size;
-
-        let filter_names = Arc::new(Mutex::new(FilterNames::new(
-            config.filter_name_size_limit,
-            config.filter_names_size_limit,
-            config.filter_names_cleanup_interval,
-        )));
 
         // Build the shared GeyserServer (Clone-able because GrpcService: Clone)
         let max_decoding_message_size = config.max_decoding_message_size;
@@ -656,9 +780,11 @@ impl GrpcService {
             replay_stored_slots_tx,
             replay_first_available_slot: replay_first_available_slot.clone(),
             debug_clients_tx,
-            filter_names,
             cancellation_token: service_cancellation_token.clone(),
             task_tracker: task_tracker.clone(),
+            filter_name_size_limit: config.filter_name_size_limit,
+            filter_names_size_limit: config.filter_names_size_limit,
+            filter_names_cleanup_interval: config.filter_names_cleanup_interval,
         })
         .max_decoding_message_size(max_decoding_message_size);
         for encoding in config.compression.accept {
@@ -670,6 +796,7 @@ impl GrpcService {
 
         // Run geyser message loop
         let (messages_tx, messages_rx) = mpsc::unbounded_channel();
+        let (block_reconstruction_tx, block_reconstruction_rx) = mpsc::unbounded_channel();
 
         // Warn if replay buffer is too small for auto-reconnect
         if config.replay_stored_slots < 150 {
@@ -679,17 +806,23 @@ impl GrpcService {
             );
         }
 
+        {
+            let broadcast_tx = broadcast_tx.clone();
+            task_tracker.spawn(async move {
+                Self::block_reconstruction_loop(
+                    block_reconstruction_rx,
+                    blocks_meta_tx,
+                    broadcast_tx,
+                    replay_stored_slots_rx,
+                    replay_first_available_slot,
+                    config.replay_stored_slots,
+                )
+                .await;
+            });
+        }
+
         task_tracker.spawn(async move {
-            Self::geyser_loop(
-                messages_rx,
-                blocks_meta_tx,
-                broadcast_tx,
-                replay_stored_slots_rx,
-                replay_first_available_slot,
-                config.replay_stored_slots,
-                parallel_encoder,
-            )
-            .await;
+            Self::geyser_loop(messages_rx, broadcast_tx, block_reconstruction_tx).await;
         });
 
         // Health check service
@@ -704,31 +837,52 @@ impl GrpcService {
 
         let shutdown_grpc = service_cancellation_token.child_token();
 
+        // The most "elegant" way would be to implement Stream for Listener and a MixedIO type that can handle all three variants.
+        // However, that adds complexity in the IO implementa has every read/write would need an extra match-expression to dispatch to the correct underlying type.
+        // Having this ugly macros is the most efficient approach and makes the code shorter when calling `serve_listener`.
+        macro_rules! with_listener {
+            ($listener:expr, |$incoming:ident| $body:expr) => {{
+                match $listener {
+                    Listener::Tcp($incoming) => $body,
+                    Listener::Unix($incoming) => $body,
+                    Listener::Tls($incoming) => $body,
+                }
+            }};
+        }
+
         // Spawn one server task per listener
+        let rate_limit_table = SharedRateLimitTable::default();
+        let ip_conncur = config.ip_conncur_rate_limit;
         for listener in listeners {
             let shutdown = shutdown_grpc.clone();
-            let tls_identity = tls_identity.clone();
             let x_token = x_token.clone();
             let health_service = health_service.clone();
             let service = service.clone();
-
+            let rate_limit_table = rate_limit_table.clone();
             task_tracker.spawn(async move {
-                if let Err(e) = GrpcService::serve_listener(
-                    listener,
-                    tls_identity,
-                    http2_adaptive_window,
-                    http2_keepalive_interval,
-                    http2_keepalive_timeout,
-                    initial_connection_window_size,
-                    initial_stream_window_size,
-                    x_token,
-                    health_service,
-                    service,
-                    traffic_reporting_threshold,
-                    shutdown.clone(),
-                )
-                .await
-                {
+                if let Err(e) = with_listener!(listener, |incoming| {
+                    let rate_limited_incoming = RateLimitedIncoming::new(
+                        incoming,
+                        ip_conncur,
+                        rate_limit_table,
+                        PrometheusRatelimitCallbacks,
+                    );
+
+                    GrpcService::serve_listener(
+                        rate_limited_incoming,
+                        http2_adaptive_window,
+                        http2_keepalive_interval,
+                        http2_keepalive_timeout,
+                        initial_connection_window_size,
+                        initial_stream_window_size,
+                        x_token,
+                        health_service,
+                        service,
+                        traffic_reporting_threshold,
+                        shutdown.clone(),
+                    )
+                    .await
+                }) {
                     error!("gRPC listener failed: {e}");
                     shutdown.cancel();
                 }
@@ -738,30 +892,94 @@ impl GrpcService {
         Ok((snapshot_tx, messages_tx))
     }
 
+    /// Core message routing loop that reconstructs Solana blocks from raw Geyser plugin events
+    /// and fans them out to subscribers at the correct commitment levels.
+    ///
+    /// # Slot status semantics
+    ///
+    /// Slot messages come in two categories with different routing rules:
+    ///
+    /// **Lifecycle statuses** (`FirstShredReceived`, `Completed`, `CreatedBank`, `Dead`):
+    /// Broadcast immediately to **all three** commitment levels (Processed, Confirmed, Finalized).
+    /// These are not commitment signals — they describe the physical state of the slot and must
+    /// reach every subscriber regardless of the commitment level they subscribed at, so they can
+    /// track slot lifecycle and detect skipped slots.
+    ///
+    /// **Commitment statuses** (`Processed`, `Confirmed`, `Finalized`):
+    /// Never broadcast directly when received from the plugin. They are fed into `BlockMachineStorage`
+    /// which holds them until the block is fully assembled. Once the block is frozen, the synthetic
+    /// slot message is broadcast to **all three** commitment levels. This guarantees that no
+    /// subscriber sees a commitment status before the block content for that slot.
+    ///
+    /// # Block content delivery
+    ///
+    /// When a block becomes ready at commitment level C (`pop_ready_block`):
+    /// 1. If C is Confirmed or Finalized: `frozen_block.messages()` (the complete, deduplicated
+    ///    set of Account/Transaction/Entry messages for that slot) is sent at level C first.
+    ///    This is omitted at Processed because those messages were already delivered individually
+    ///    as they arrived.
+    /// 2. `Message::Block` (the precomputed block summary) is sent at level C.
+    /// 3. The synthetic Processed/Confirmed/Finalized slot status message is sent to all three
+    ///    commitment levels.
+    ///
+    /// This ordering guarantee — block content before `Message::Block` before slot status — must
+    /// be preserved so that subscribers always observe a complete block before the commitment signal.
+    ///
+    /// # Account deduplication
+    ///
+    /// Within a slot, if multiple updates arrive for the same account pubkey, only the update with
+    /// the highest `write_version` is retained in the frozen block. This is handled internally by
+    /// `BlockMachineStorage` / `ProcessingSlot` and must not be bypassed.
+    ///
+    /// # Missing commitment level gap-filling
+    ///
+    /// If a higher commitment level arrives without a prior lower one (e.g. Finalized before
+    /// Confirmed), `BlocksStateMachine` synthesizes the missing levels in order
+    /// (Processed → Confirmed → Finalized). Each synthesized level causes a separate
+    /// `pop_ready_block` entry and a separate fan-out.
+    ///
+    /// # Ancestor slot propagation
+    ///
+    /// When a descendant slot is finalized, `BlocksStateMachine` retroactively finalizes all
+    /// ancestor slots that were not yet finalized. This mirrors the parent-chain walk that
+    /// `geyser_loop` performs manually. It must not be short-circuited.
+    ///
+    /// # Batching and metrics
+    ///
+    /// Up to `PROCESSED_MESSAGES_MAX` messages are drained from `messages_rx` per iteration
+    /// to amortise channel overhead. Before each Processed broadcast, `encode_messages` pre-encodes
+    /// Account and Transaction payloads (stored in a `OnceLock` on the shared `Arc`) so that
+    /// per-client serialisation is avoided. `GEYSER_BATCH_SIZE` is observed for each Processed
+    /// broadcast.
+    ///
+    /// # Side channels
+    ///
+    /// - `blocks_meta_tx`: receives every `Slot` and `BlockMeta` message verbatim for external
+    ///   consumers that track block metadata independently of the main broadcast.
+    /// - `replay_stored_slots_rx`: services replay requests from newly-connected subscribers.
+    ///   `replay_first_available_slot` is updated after every batch to reflect the oldest slot
+    ///   still available in the replay buffer, and is exposed via `subscribe_first_available_slot`.
     async fn geyser_loop(
         mut messages_rx: mpsc::UnboundedReceiver<Message>,
-        blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
         broadcast_tx: broadcast::Sender<BroadcastedMessage>,
-        replay_stored_slots_rx: Option<mpsc::Receiver<ReplayStoredSlotsRequest>>,
-        replay_first_available_slot: Option<Arc<AtomicU64>>,
-        replay_stored_slots: u64,
-        parallel_encoder: ParallelEncoder,
+        block_reconstruction_tx: mpsc::UnboundedSender<Arc<Vec<Message>>>,
     ) {
         const PROCESSED_MESSAGES_MAX: usize = 31;
-        const PROCESSED_MESSAGES_SLEEP: Duration = Duration::from_millis(10);
+        const STATE_MESSAGES_MAX: usize = 4; /* In a reasonable loop, we don't expect to receive more than FirstShredReceived, Completed, CreatedBank, or Finalized messages per iteration */
 
-        /// Slots retained beyond replay buffer for parent chain status propagation
-        /// and late-arriving block_meta messages.
-        const FINALIZATION_SAFETY_BUFFER: u64 = 10;
-
-        let mut msgid_gen = MessageId::default();
-        let mut messages: BTreeMap<u64, SlotMessages> = Default::default();
         let mut processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
-        let mut processed_first_slot = None;
-        let processed_sleep = sleep(PROCESSED_MESSAGES_SLEEP);
-        tokio::pin!(processed_sleep);
-        let (_tx, rx) = mpsc::channel(1);
-        let mut replay_stored_slots_rx = replay_stored_slots_rx.unwrap_or(rx);
+        let mut confirmed_messages = Vec::with_capacity(STATE_MESSAGES_MAX);
+        let mut finalized_messages = Vec::with_capacity(STATE_MESSAGES_MAX);
+        let mut block_reconstruction_messages = Vec::with_capacity(STATE_MESSAGES_MAX);
+
+        let is_block_reconstruction_message = |message: &Message| match message {
+            Message::BlockMeta(_) => true,
+            Message::Slot(slot_message) => matches!(
+                slot_message.status,
+                SlotStatus::Processed | SlotStatus::Confirmed | SlotStatus::Finalized
+            ),
+            _ => false,
+        };
 
         loop {
             tokio::select! {
@@ -770,330 +988,223 @@ impl GrpcService {
                         info!("Geyser loop: messages channel closed");
                         break;
                     };
+
                     metrics::message_queue_size_dec();
-                    let msgid = msgid_gen.next();
 
-                    // Update metrics
-                    if let Message::Slot(slot_message) = &message {
-                        metrics::update_slot_plugin_status(slot_message.status, slot_message.slot);
+                    if is_block_reconstruction_message(&message) {
+                        block_reconstruction_messages.push(message);
+                    }
+                    else {
+                        processed_messages.push(message);
                     }
 
-                    // Update blocks info
-                    if let Some(blocks_meta_tx) = &blocks_meta_tx {
-                        if matches!(&message, Message::Slot(_) | Message::BlockMeta(_)) {
-                            let _ = blocks_meta_tx.send(message.clone());
+                    while let Ok(message) = messages_rx.try_recv() {
+                        metrics::message_queue_size_dec();
+
+                        if is_block_reconstruction_message(&message) {
+                            block_reconstruction_messages.push(message);
                         }
-                    }
-
-                    // Remove outdated block reconstruction info
-                    match &message {
-                        // On startup we can receive multiple Confirmed/Finalized slots without BlockMeta message
-                        // With saved first Processed slot we can ignore errors caused by startup process
-                        Message::Slot(msg) if processed_first_slot.is_none() && msg.status == SlotStatus::Processed => {
-                            processed_first_slot = Some(msg.slot);
-                        }
-                        Message::Slot(msg) if msg.status == SlotStatus::Finalized => {
-                            // keep extra 10 slots + slots for replay
-                            if let Some(msg_slot) = msg.slot.checked_sub(FINALIZATION_SAFETY_BUFFER + replay_stored_slots) {
-                                loop {
-                                    match messages.keys().next().cloned() {
-                                        Some(slot) if slot < msg_slot => {
-                                            if let Some(slot_messages) = messages.remove(&slot) {
-                                                match processed_first_slot {
-                                                    Some(processed_first) if slot <= processed_first => continue,
-                                                    None => continue,
-                                                    _ => {}
-                                                }
-
-                                                if !slot_messages.sealed && slot_messages.finalized_at.is_some() {
-                                                    let mut reasons = vec![];
-                                                    if let Some(block_meta) = slot_messages.block_meta {
-                                                        let block_txn_count = block_meta.executed_transaction_count as usize;
-                                                        let msg_txn_count = slot_messages.transactions.len();
-                                                        if block_txn_count != msg_txn_count {
-                                                            reasons.push("InvalidTxnCount");
-                                                            error!("failed to reconstruct #{slot} -- tx count: {block_txn_count} vs {msg_txn_count}");
-                                                        }
-                                                        let block_entries_count = block_meta.entries_count as usize;
-                                                        let msg_entries_count = slot_messages.entries.len();
-                                                        if block_entries_count != msg_entries_count {
-                                                            reasons.push("InvalidEntriesCount");
-                                                            error!("failed to reconstruct #{slot} -- entries count: {block_entries_count} vs {msg_entries_count}");
-                                                        }
-                                                    } else {
-                                                        reasons.push("NoBlockMeta");
-                                                    }
-                                                    let reason = reasons.join(",");
-
-                                                    metrics::update_invalid_blocks(format!("failed reconstruct {reason}"));
-                                                }
-                                            }
-                                        }
-                                        _ => break,
-                                    }
-                                }
-                                if let Some(stored) = &replay_first_available_slot {
-                                    if let Some(slot) = messages.keys().next().copied() {
-                                        stored.store(slot, Ordering::Relaxed);
-                                    }
-                                }
+                        else {
+                            processed_messages.push(message);
+                            if processed_messages.len() >= PROCESSED_MESSAGES_MAX {
+                                break;
                             }
                         }
-                        _ => {}
                     }
 
-                    // Update block reconstruction info
-                    let slot_messages = messages.entry(message.get_slot()).or_default();
-                    if let Message::Slot(msg) = &message {
-                        match msg.status {
-                            SlotStatus::Processed => {
-                                slot_messages.parent_slot = msg.parent;
-                            },
-                            SlotStatus::Confirmed => {
-                                slot_messages.confirmed = true;
-                            },
-                            SlotStatus::Finalized => {
-                                slot_messages.finalized = true;
-                            },
-                            _ => {}
-                        }
-                    }
-                    if matches!(&message, Message::Slot(_)) {
-                        slot_messages.messages_slots.push((msgid, message.clone()));
-                    } else {
-                        slot_messages.messages.push(Some((msgid, message.clone())));
-
-                        // If we already build Block message, new message will be a problem
-                        if slot_messages.sealed && !(matches!(&message, Message::Entry(_)) && slot_messages.entries_count == 0) {
-                            let kind = match &message {
-                                Message::Slot(_) => "Slot",
-                                Message::Account(_) => "Account",
-                                Message::Transaction(_) => "Transaction",
-                                Message::Entry(_) => "Entry",
-                                Message::BlockMeta(_) => "BlockMeta",
-                                Message::Block(_) => "Block",
-                            };
-                            metrics::update_invalid_blocks(format!("unexpected message {kind}"));
-                        }
-                    }
-                    let mut sealed_block_msg = None;
-                    match &message {
-                        Message::BlockMeta(msg) => {
-                            if slot_messages.block_meta.is_some() {
-                                metrics::update_invalid_blocks("unexpected message: BlockMeta (duplicate)");
-                            }
-                            slot_messages.block_meta = Some(Arc::clone(msg));
-                            sealed_block_msg = slot_messages.try_seal(&mut msgid_gen);
-                        }
-                        Message::Transaction(msg) => {
-                            slot_messages.transactions.push(Arc::clone(&msg.transaction));
-                            sealed_block_msg = slot_messages.try_seal(&mut msgid_gen);
-                        }
-                        // Dedup accounts by max write_version
-                        Message::Account(msg) => {
-                            metrics::observe_geyser_account_update_received(msg.account.data.len());
-                            let write_version = msg.account.write_version;
-                            let msg_index = slot_messages.messages.len() - 1;
-                            if let Some(entry) = slot_messages.accounts_dedup.get_mut(&msg.account.pubkey) {
-                                if entry.0 < write_version {
-                                    // We can replace the message, but in this case we will lose the order
-                                    slot_messages.messages[entry.1] = None;
-                                    *entry = (write_version, msg_index);
-                                } else {
-                                    // If the new write_version is lower than the latest one, we need to drop this message
-                                    // because we would have more than 1 image in slot_messages.messages
-                                    slot_messages.messages[msg_index] = None;
+                    for message in processed_messages.iter() {
+                        match message {
+                            Message::Slot(slot_message) => {
+                                // Only match on slot lifecycle update not commitment update, as
+                                // we must go through the block machine to make sure users sees block content before any commitment update.
+                                if matches!(slot_message.status,
+                                    SlotStatus::FirstShredReceived |
+                                    SlotStatus::Completed |
+                                    SlotStatus::CreatedBank |
+                                    SlotStatus::Dead
+                                ) {
+                                    confirmed_messages.push(Message::Slot(slot_message.clone()));
+                                    finalized_messages.push(Message::Slot(slot_message.clone()));
                                 }
-                            } else {
-                                slot_messages.accounts_dedup.insert(msg.account.pubkey, (write_version, msg_index));
+                            }
+                            Message::Block(_) => {
+                               unreachable!("Block message should not be sent by plugin directly, it is constructed in geyser loop after receiving all necessary messages for the slot and then broadcasted to subscribers");
+                            }
+                            _ => {
+                                /* We don't need to process anything here.  */
                             }
                         }
-                        Message::Entry(msg) => {
-                            slot_messages.entries.push(Arc::clone(msg));
-                            sealed_block_msg = slot_messages.try_seal(&mut msgid_gen);
-                        }
-                        _ => {}
                     }
 
-                    // Send messages to filter (and to clients)
-                    let mut messages_vec = Vec::with_capacity(4);
-                    if let Some(sealed_block_msg) = sealed_block_msg {
-                        messages_vec.push(sealed_block_msg);
+                    encode_messages(&processed_messages);
+                    GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
+
+                    let processed_messages_arc = Arc::new(processed_messages);
+                    let _ = broadcast_tx.send((CommitmentLevel::Processed, Arc::clone(&processed_messages_arc)));
+                    processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
+
+                    if !confirmed_messages.is_empty() {
+                        let _ = broadcast_tx.send((CommitmentLevel::Confirmed, Arc::new(confirmed_messages)));
+                        confirmed_messages = Vec::with_capacity(STATE_MESSAGES_MAX);
                     }
-                    let slot_status = if let Message::Slot(msg) = &message {
-                        Some((msg.slot, msg.status))
-                    } else {
-                        None
+
+                    if !finalized_messages.is_empty() {
+                        let _ = broadcast_tx.send((CommitmentLevel::Finalized, Arc::new(finalized_messages)));
+                        finalized_messages = Vec::with_capacity(STATE_MESSAGES_MAX);
+                    }
+
+                    let _ = block_reconstruction_tx.send(processed_messages_arc);
+
+                    // Make sure that blockmeta is always after all kind of other events so the block-machine sees every block
+                    // updates.
+                    if !block_reconstruction_messages.is_empty() {
+                        let _ = block_reconstruction_tx.send(Arc::new(block_reconstruction_messages));
+                        block_reconstruction_messages = Vec::with_capacity(STATE_MESSAGES_MAX);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn block_reconstruction_loop(
+        mut messages_rx: mpsc::UnboundedReceiver<Arc<Vec<Message>>>,
+        blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
+        broadcast_tx: broadcast::Sender<BroadcastedMessage>,
+        replay_stored_slots_rx: Option<mpsc::Receiver<ReplayStoredSlotsRequest>>,
+        replay_first_available_slot: Option<Arc<AtomicU64>>,
+        replay_stored_slots: u64,
+    ) {
+        let (_tx, rx) = mpsc::channel(1);
+        let mut replay_stored_slots_rx = replay_stored_slots_rx.unwrap_or(rx);
+
+        let mut block_machine = BlockMachineStorage::new(replay_stored_slots as usize);
+        const ALL_COMMITMENT_LEVELS: [CommitmentLevel; 3] = [
+            CommitmentLevel::Processed,
+            CommitmentLevel::Confirmed,
+            CommitmentLevel::Finalized,
+        ];
+
+        const BUFFERED_MESSAGES_CAPACITY: usize = 32;
+        let mut buffered_messages = Vec::with_capacity(BUFFERED_MESSAGES_CAPACITY);
+
+        loop {
+            tokio::select! {
+                maybe = messages_rx.recv() => {
+                    let Some(messages) = maybe else {
+                        info!("Geyser loop: messages channel closed");
+                        break;
                     };
-                    messages_vec.push((msgid, message));
 
-                    // sometimes we do not receive all statuses
-                    if let Some((slot, status)) = slot_status {
-                        let mut slots = vec![slot];
-                        while let Some((parent, Some(entry))) = slots
-                            .pop()
-                            .and_then(|slot| messages.get(&slot))
-                            .and_then(|entry| entry.parent_slot)
-                            .map(|parent| (parent, messages.get_mut(&parent)))
-                        {
-                            if (status == SlotStatus::Confirmed && !entry.confirmed) ||
-                                (status == SlotStatus::Finalized && !entry.finalized)
-                            {
-                                if status == SlotStatus::Confirmed {
-                                    entry.confirmed = true;
-                                } else if status == SlotStatus::Finalized {
-                                    entry.finalized = true;
+                    buffered_messages.push(messages);
+
+                    while let Ok(messages) = messages_rx.try_recv() {
+                        buffered_messages.push(messages);
+                        if buffered_messages.len() >= BUFFERED_MESSAGES_CAPACITY {
+                            break;
+                        }
+                    }
+
+                    for messages in buffered_messages.drain(..) {
+                        for message in messages.iter() {
+                            if let Message::Slot(slot_message) = message {
+                                metrics::update_slot_plugin_status(slot_message.status, slot_message.slot);
+                            }
+
+                            if let Some(blocks_meta_tx) = &blocks_meta_tx {
+                                if matches!(&message, Message::Slot(_) | Message::BlockMeta(_)) {
+                                    let _ = blocks_meta_tx.send(message.clone());
+                                }
+                            }
+
+                            block_machine.add(message.clone());
+
+                            while let Some((slot_update, frozen_block)) = block_machine.pop_ready_block() {
+                                let commitment_level = match slot_update.commitment {
+                                    solana_commitment_config::CommitmentLevel::Processed => CommitmentLevel::Processed,
+                                    solana_commitment_config::CommitmentLevel::Confirmed => CommitmentLevel::Confirmed,
+                                    solana_commitment_config::CommitmentLevel::Finalized => CommitmentLevel::Finalized,
+                                };
+                                // Processed must be sent differently, since processed geyser event were individually sent,
+                                // we only need to send Message::Block for block subscriber downstream.
+                                // While, confirmed,finalized must be sent in the two flavors: as a stream of individual events and block.
+                                if commitment_level != CommitmentLevel::Processed {
+                                    let _ = broadcast_tx.send((commitment_level, frozen_block.messages()));
                                 }
 
-                                slots.push(parent);
-                                let message_slot = Message::Slot(MessageSlot {
-                                    slot: parent,
-                                    parent: entry.parent_slot,
-                                    status,
+                                let block_meta = Message::BlockMeta(frozen_block.get_block_meta());
+                                let msg_block = Message::Block(Arc::new(frozen_block.get_message_block()));
+                                let _ = broadcast_tx.send((commitment_level, Arc::new(vec![msg_block, block_meta])));
+
+                                let slot_message = Message::Slot(MessageSlot {
+                                    slot: slot_update.slot,
+                                    parent: slot_update.parent_slot,
+                                    status: match slot_update.commitment {
+                                        solana_commitment_config::CommitmentLevel::Processed => SlotStatus::Processed,
+                                        solana_commitment_config::CommitmentLevel::Confirmed => SlotStatus::Confirmed,
+                                        solana_commitment_config::CommitmentLevel::Finalized => SlotStatus::Finalized,
+                                    },
                                     dead_error: None,
                                     created_at: Timestamp::from(SystemTime::now())
                                 });
-                                messages_vec.push((msgid_gen.next(), message_slot));
-                                metrics::missed_status_message_inc(status);
+                                let slot_message_singleton_vec = Arc::new(vec![slot_message.clone()]);
+                                for commitment_level in ALL_COMMITMENT_LEVELS {
+                                    let _ = broadcast_tx.send((commitment_level, Arc::clone(&slot_message_singleton_vec)));
+                                }
+                            }
+
+                            let min_replayable_slot = block_machine.min_replayable_slot();
+                            if let (Some(min_slot), Some(replay_first_available_slot)) = (min_replayable_slot, replay_first_available_slot.as_ref()) {
+                                replay_first_available_slot.store(min_slot, Ordering::Relaxed);
                             }
                         }
                     }
-
-                    for message in messages_vec.into_iter().rev() {
-                        if let Message::Slot(slot) = &message.1 {
-                            let (mut confirmed_messages, mut finalized_messages) = match slot.status {
-                                SlotStatus::Processed | SlotStatus::FirstShredReceived | SlotStatus::Completed | SlotStatus::CreatedBank | SlotStatus::Dead => {
-                                    (Vec::with_capacity(1), Vec::with_capacity(1))
-                                }
-                                SlotStatus::Confirmed => {
-                                    if let Some(slot_messages) = messages.get_mut(&slot.slot) {
-                                        if !slot_messages.sealed {
-                                            slot_messages.confirmed_at = Some(slot_messages.messages.len());
-                                        }
-                                    }
-
-                                    let vec = messages
-                                        .get(&slot.slot)
-                                        .map(|slot_messages| slot_messages.messages.iter().flatten().cloned().collect())
-                                        .unwrap_or_default();
-                                    (vec, Vec::with_capacity(1))
-                                }
-                                SlotStatus::Finalized => {
-                                    if let Some(slot_messages) = messages.get_mut(&slot.slot) {
-                                        if !slot_messages.sealed {
-                                            slot_messages.finalized_at = Some(slot_messages.messages.len());
-                                        }
-                                    }
-
-                                    let vec = messages
-                                        .get_mut(&slot.slot)
-                                        .map(|slot_messages| slot_messages.messages.iter().flatten().cloned().collect())
-                                        .unwrap_or_default();
-                                    (Vec::with_capacity(1), vec)
-                                }
-                            };
-
-                            // processed
-                            processed_messages.push(message.clone());
-                            GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
-                            let encoded = parallel_encoder.encode(processed_messages).await;
-                            let _ =
-                                broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
-                            processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
-                            processed_sleep
-                                .as_mut()
-                                .reset(Instant::now() + PROCESSED_MESSAGES_SLEEP);
-
-                            // confirmed
-                            confirmed_messages.push(message.clone());
-                            let _ =
-                                broadcast_tx.send((CommitmentLevel::Confirmed, confirmed_messages.into()));
-
-                            // finalized
-                            finalized_messages.push(message);
-                            let _ =
-                                broadcast_tx.send((CommitmentLevel::Finalized, finalized_messages.into()));
-                        } else {
-                            let mut confirmed_messages = vec![];
-                            let mut finalized_messages = vec![];
-                            if matches!(&message.1, Message::Block(_)) {
-                                if let Some(slot_messages) = messages.get(&message.1.get_slot()) {
-                                    if let Some(confirmed_at) = slot_messages.confirmed_at {
-                                        confirmed_messages.extend(
-                                            slot_messages.messages.as_slice()[confirmed_at..].iter().filter_map(|x| x.clone())
-                                        );
-                                    }
-                                    if let Some(finalized_at) = slot_messages.finalized_at {
-                                        finalized_messages.extend(
-                                            slot_messages.messages.as_slice()[finalized_at..].iter().filter_map(|x| x.clone())
-                                        );
-                                    }
-                                }
-                            }
-
-                            processed_messages.push(message);
-                            if processed_messages.len() >= PROCESSED_MESSAGES_MAX
-                                || !confirmed_messages.is_empty()
-                                || !finalized_messages.is_empty()
-                            {
-                                GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
-                                let encoded = parallel_encoder.encode(processed_messages).await;
-                                let _ = broadcast_tx
-                                    .send((CommitmentLevel::Processed, encoded.into()));
-                                processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
-                                processed_sleep
-                                    .as_mut()
-                                    .reset(Instant::now() + PROCESSED_MESSAGES_SLEEP);
-                            }
-
-                            if !confirmed_messages.is_empty() {
-                                let _ =
-                                    broadcast_tx.send((CommitmentLevel::Confirmed, confirmed_messages.into()));
-                            }
-
-                            if !finalized_messages.is_empty() {
-                                let _ =
-                                    broadcast_tx.send((CommitmentLevel::Finalized, finalized_messages.into()));
-                            }
-                        }
-                    }
-                }
-                () = &mut processed_sleep => {
-                    if !processed_messages.is_empty() {
-                        GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
-                        let encoded = parallel_encoder.encode(processed_messages).await;
-                        let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
-                        processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
-                    }
-                    processed_sleep.as_mut().reset(Instant::now() + PROCESSED_MESSAGES_SLEEP);
-                }
+                },
                 Some((commitment, replay_slot, tx)) = replay_stored_slots_rx.recv() => {
-                    if let Some((slot, _)) = messages.first_key_value() {
-                        if replay_slot < *slot {
-                            let _ = tx.send(ReplayedResponse::Lagged(*slot));
+
+                    if let Some(slot) = block_machine.min_replayable_slot() {
+                        if replay_slot < slot {
+                            let _ = tx.send(ReplayedResponse::Lagged(slot));
                             continue;
                         }
                     }
+                    let min_solana_commitment = match commitment {
+                        CommitmentLevel::Processed => solana_commitment_config::CommitmentLevel::Processed,
+                        CommitmentLevel::Confirmed => solana_commitment_config::CommitmentLevel::Confirmed,
+                        CommitmentLevel::Finalized => solana_commitment_config::CommitmentLevel::Finalized,
+                    };
 
                     let mut replayed_messages = Vec::with_capacity(32_768);
-                    for (slot, messages) in messages.iter() {
-                        if *slot >= replay_slot {
-                            replayed_messages.extend_from_slice(&messages.messages_slots);
-                            if commitment == CommitmentLevel::Processed
-                                || (commitment == CommitmentLevel::Finalized && messages.finalized)
-                                || (commitment == CommitmentLevel::Confirmed && messages.confirmed)
-                            {
-                                replayed_messages.extend(messages.messages.iter().filter_map(|v| v.clone()));
-                            }
-                        }
+                    let replayed_slot_iter = block_machine.replay_from_slot(replay_slot, min_solana_commitment);
+
+                    for replayed_slot in replayed_slot_iter {
+                        let xs = replayed_slot
+                            .slot_status_messages
+                            .iter()
+                            .map(|s| {
+                                Message::Slot(MessageSlot {
+                                    slot: s.slot,
+                                    parent: None,
+                                    status: match s.commitment {
+                                        solana_commitment_config::CommitmentLevel::Processed => SlotStatus::Processed,
+                                        solana_commitment_config::CommitmentLevel::Confirmed => SlotStatus::Confirmed,
+                                        solana_commitment_config::CommitmentLevel::Finalized => SlotStatus::Finalized,
+                                    },
+                                    dead_error: None,
+                                    created_at: Timestamp::from(SystemTime::now())
+                                })
+                            });
+                        replayed_messages.extend(xs);
+                        replayed_messages.extend(replayed_slot.frozen_block.messages().iter().cloned());
                     }
                     let _ = tx.send(ReplayedResponse::Messages(replayed_messages));
                 }
-                else => break,
+                else => {
+                    // No new messages and replay request channel closed, can only happen on shutdown
+                    info!("Block reconstruction loop: replay_stored_slots channel closed");
+                    break;
+                }
             }
         }
-
-        info!("Geyser loop exiting");
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1207,7 +1318,7 @@ impl GrpcService {
                                     break 'outer;
                                 }
 
-                                let mut messages = match rx.await {
+                                let messages = match rx.await {
                                     Ok(ReplayedResponse::Messages(messages)) => messages,
                                     Ok(ReplayedResponse::Lagged(slot)) => {
                                         info!("client #{id}: broadcast from {from_slot} is not available");
@@ -1230,14 +1341,11 @@ impl GrpcService {
                                     }
                                 };
 
-                                messages.sort_by_key(|msg| msg.0);
-                                for (_msgid, message) in messages.iter() {
+                                for message in messages.iter() {
                                     for message in session.filter.get_updates(message, Some(commitment)) {
-                                        let proto_size = message.encoded_len().min(u32::MAX as usize) as u32;
                                         match stream_tx.send(Ok(message)).await {
                                             Ok(()) => {
                                                 metrics::incr_grpc_message_sent_counter(&session.subscriber_id);
-                                                metrics::incr_grpc_bytes_sent(&session.subscriber_id, proto_size);
                                             }
                                             Err(mpsc::error::SendError(_)) => {
                                                 error!("client #{id}: stream closed");
@@ -1277,13 +1385,11 @@ impl GrpcService {
                     };
 
                     if commitment == session.filter.get_commitment_level() {
-                        for (_msgid, message) in messages.iter() {
+                        for message in messages.iter() {
                             for message in session.filter.get_updates(message, Some(commitment)) {
-                                let proto_size = message.encoded_len().min(u32::MAX as usize) as u32;
                                 match stream_tx.try_send(Ok(message)) {
                                     Ok(()) => {
                                         metrics::incr_grpc_message_sent_counter(&session.subscriber_id);
-                                        metrics::incr_grpc_bytes_sent(&session.subscriber_id, proto_size);
                                     }
                                     Err(mpsc::error::TrySendError::Full(_)) => {
                                         error!("client #{id}: lagged to send an update");
@@ -1305,7 +1411,7 @@ impl GrpcService {
 
                     if commitment == CommitmentLevel::Processed && session.debug_client_tx.is_some() {
                         for message in messages.iter() {
-                            if let Message::Slot(slot_message) = &message.1 {
+                            if let Message::Slot(slot_message) = &message {
                                 DebugClientMessage::maybe_send(&session.debug_client_tx, || DebugClientMessage::UpdateSlot { id, slot: slot_message.slot });
                             }
                         }
@@ -1393,9 +1499,8 @@ impl GrpcService {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn serve_listener<H>(
-        listener: Listener,
-        tls_identity: Option<Identity>,
+    async fn serve_listener<H, I, IO>(
+        incoming: I,
         http2_adaptive_window: Option<bool>,
         http2_keepalive_interval: Option<Duration>,
         http2_keepalive_timeout: Option<Duration>,
@@ -1408,18 +1513,11 @@ impl GrpcService {
         shutdown: CancellationToken,
     ) -> anyhow::Result<()>
     where
+        I: Stream<Item = io::Result<IO>> + Send + 'static,
+        IO: Connected + AsyncRead + AsyncWrite + Unpin + Send + 'static,
         H: tonic_health::pb::health_server::Health,
     {
         let mut builder = Server::builder();
-
-        // TLS only applies to TCP — UDS is local IPC, no encryption needed
-        if matches!(listener, Listener::Tcp(_)) {
-            if let Some(identity) = tls_identity {
-                builder = builder
-                    .tls_config(ServerTlsConfig::new().identity(identity))
-                    .context("failed to apply tls_config")?;
-            }
-        }
 
         if let Some(enabled) = http2_adaptive_window {
             builder = builder.http2_adaptive_window(Some(enabled));
@@ -1436,56 +1534,19 @@ impl GrpcService {
         if let Some(sz) = initial_stream_window_size {
             builder = builder.initial_stream_window_size(sz);
         }
-
-        let router = builder
-            .layer(MeteredLayer::new())
+        builder
+            .layer(MeteredBandwidthLayer::new(
+                PrometheusMeteredManager,
+                traffic_reporting_threshold,
+            ))
             .layer(interceptor::InterceptorLayer::new(XTokenInterceptor {
                 x_token,
             }))
             .add_service(health_service)
-            .add_service(service);
-
-        // Capture address before match consumes listener
-        let addr = match &listener {
-            Listener::Tcp(incoming) => incoming
-                .local_addr()
-                .map(|a| a.to_string())
-                .unwrap_or_else(|_| "unknown".to_owned()),
-            Listener::Unix(path, _) => format!("unix://{}", path.display()),
-        };
-
-        info!("gRPC server listening on {addr}");
-
-        let result = match listener {
-            Listener::Tcp(incoming) => {
-                let spy = SpyIncoming::new(
-                    incoming,
-                    SpyIncomingConfig {
-                        traffic_reporting_threshold,
-                    },
-                );
-                router
-                    .serve_with_incoming_shutdown(spy, shutdown.cancelled())
-                    .await
-                    .context("TCP listener error")
-            }
-            Listener::Unix(path, incoming) => {
-                let result = router
-                    .serve_with_incoming_shutdown(incoming, shutdown.cancelled())
-                    .await
-                    .context("UDS listener error");
-
-                if let Err(e) = std::fs::remove_file(&path) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        log::warn!("failed to remove socket file {}: {e}", path.display());
-                    }
-                }
-                result
-            }
-        };
-
-        info!("gRPC server on {addr} shut down with result: {result:?}");
-        result
+            .add_service(service)
+            .serve_with_incoming_shutdown(incoming, shutdown.cancelled())
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -1608,11 +1669,15 @@ impl Geyser for GrpcService {
             .unwrap_or_else(|| "".to_owned());
 
         let config_filter_limits = Arc::clone(&self.config_filter_limits);
-        let filter_names = Arc::clone(&self.filter_names);
         let incoming_stream_tx = stream_tx.clone();
         let incoming_client_tx = client_tx;
         let incoming_cancellation_token = client_cancellation_token.child_token();
 
+        let mut filter_names = FilterNames::new(
+            self.filter_name_size_limit,
+            self.filter_names_size_limit,
+            self.filter_names_cleanup_interval,
+        );
         self.task_tracker.spawn(async move {
             loop {
                 tokio::select! {
@@ -1622,7 +1687,6 @@ impl Geyser for GrpcService {
                     }
                     message = request.get_mut().message() => match message {
                         Ok(Some(request)) => {
-                            let mut filter_names = filter_names.lock().await;
                             filter_names.try_clean();
 
                             if let Err(error) = match Filter::new(&request, &config_filter_limits, &mut filter_names) {
@@ -1909,7 +1973,7 @@ mod tests {
             dead_error: None,
             created_at: Timestamp::from(SystemTime::now()),
         });
-        let _ = broadcast_tx.send((CommitmentLevel::Processed, Arc::new(vec![(1, msg)])));
+        let _ = broadcast_tx.send((CommitmentLevel::Processed, Arc::new(vec![msg])));
 
         tokio::time::timeout(Duration::from_secs(2), handle)
             .await

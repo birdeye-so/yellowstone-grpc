@@ -152,6 +152,15 @@ pub struct GrpcAddresses {
     pub inner: Vec<GrpcAddress>,
 }
 
+impl IntoIterator for GrpcAddresses {
+    type Item = GrpcAddress;
+    type IntoIter = std::vec::IntoIter<GrpcAddress>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.into_iter()
+    }
+}
+
 impl<'de> Deserialize<'de> for GrpcAddress {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -258,14 +267,12 @@ impl<'de> Deserialize<'de> for GrpcAddresses {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigGrpc {
-    /// Multiple addresses of Grpc service.
-    pub address: GrpcAddresses,
-
     #[serde(default)]
     pub enable_snapshot_accounts: bool,
 
+    pub address: Option<GrpcAddresses>,
     /// TLS config
-    pub tls_config: Option<ConfigGrpcServerTls>,
+    pub tls_config: Option<TlsIdentityPair>,
     /// Possible compression options
     #[serde(default)]
     pub compression: ConfigGrpcCompression,
@@ -339,12 +346,6 @@ pub struct ConfigGrpc {
         deserialize_with = "deserialize_int_str"
     )]
     pub replay_stored_slots: u64,
-    /// Number of threads for parallel encoding
-    #[serde(
-        default = "ConfigGrpc::encoder_threads_default",
-        deserialize_with = "deserialize_int_str"
-    )]
-    pub encoder_threads: usize,
     #[serde(default)]
     pub server_http2_adaptive_window: Option<bool>,
     #[serde(default, with = "humantime_serde")]
@@ -362,9 +363,51 @@ pub struct ConfigGrpc {
     ///
     #[serde(default)]
     pub traffic_reporting_byte_threhsold: Option<ByteSize>,
+
+    ///
+    /// Optional directory to load TLS certificates for gRPC server. If set, the server will start in TLS mode and load certificates from the provided directory.
+    ///
+    /// This option is mutually exclusive with `tls_config`. If both are set, the server will prioritize `cert_dir`.
+    #[serde(default)]
+    pub cert_dir: Option<PathBuf>,
+
+    ///
+    /// Maximum concurrent connections allowed per remote IP address. If not set, there is no limit enforced at the transport layer,
+    /// but the server may still enforce limits at the application layer (e.g. subscription_limit).
+    ///
+    /// Defaults to 2^64 - 1 (effectively no limit).
+    ///
+    #[serde(
+        default = "ConfigGrpc::default_max_ip_conncur",
+        deserialize_with = "deserialize_int_str"
+    )]
+    pub ip_conncur_rate_limit: u64,
+
+    #[serde(default)]
+    pub listen: Option<Vec<ListenConfig>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum GrpcTlsConfig {
+    /// A pair of private-key and cert file paths
+    IdentityPair { identity: TlsIdentityPair },
+    /// HAPROXY-like cert directory with `*.pem` files containing the certs and private keys.
+    CertDir { cert_dir: PathBuf },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListenConfig {
+    pub address: GrpcAddress,
+    pub tls: Option<GrpcTlsConfig>,
 }
 
 impl ConfigGrpc {
+    const fn default_max_ip_conncur() -> u64 {
+        u64::MAX
+    }
+
     const fn max_decoding_message_size_default() -> usize {
         4 * 1024 * 1024
     }
@@ -404,15 +447,11 @@ impl ConfigGrpc {
     const fn default_replay_stored_slots() -> u64 {
         150
     }
-
-    const fn encoder_threads_default() -> usize {
-        4
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ConfigGrpcServerTls {
+pub struct TlsIdentityPair {
     pub cert_path: String,
     pub key_path: String,
 }

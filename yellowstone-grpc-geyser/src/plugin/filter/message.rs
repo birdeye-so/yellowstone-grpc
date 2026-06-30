@@ -13,6 +13,7 @@ use {
         buf::{Buf, BufMut},
         Bytes,
     },
+    foldhash::{HashSet as FoldHashSet, HashSetExt},
     prost::{
         encoding::{
             encode_key, encode_varint, encoded_len_varint, key_len, message, DecodeContext,
@@ -22,9 +23,9 @@ use {
     },
     prost_types::Timestamp,
     smallvec::SmallVec,
+    solana_pubkey::Pubkey,
     solana_signature::Signature,
     std::{
-        collections::HashSet,
         ops::{Deref, DerefMut},
         sync::{Arc, OnceLock},
         time::SystemTime,
@@ -288,8 +289,10 @@ impl FilteredUpdate {
                             ..confirmed_block::TransactionStatusMeta::default()
                         },
                         index: msg.index as usize,
-                        account_keys: HashSet::new(),
+                        account_keys: FoldHashSet::new(),
                         pre_encoded: OnceLock::new(),
+                        token_owners_all: OnceLock::new(),
+                        token_owners_changed: OnceLock::new(),
                     }),
                     slot: msg.slot,
                 })
@@ -532,6 +535,11 @@ impl FilteredUpdateAccount {
         account: &MessageAccountInfo,
         data_slice: &FilterAccountsDataSlice,
     ) -> usize {
+        const PUBKEY_FIELD_ENCODED_LEN: usize = prost_field_encoded_len(1u32, size_of::<Pubkey>());
+        const OWNER_FIELD_ENCODED_LEN: usize = prost_field_encoded_len(3u32, size_of::<Pubkey>());
+        const SIGNATURE_FIELD_ENCODED_LEN: usize =
+            prost_field_encoded_len(8u32, size_of::<Signature>());
+
         // use pre-encoded length if: no slicing and pre-encoded exists
         if data_slice.as_ref().is_empty() {
             if let Some(pre_encoded) = account.get_pre_encoded() {
@@ -542,13 +550,13 @@ impl FilteredUpdateAccount {
         // fallback: calculate with slicing
         let data_len = data_slice.get_slice_len(&account.data);
 
-        prost_bytes_encoded_len(1u32, account.pubkey.as_ref())
+        PUBKEY_FIELD_ENCODED_LEN
             + if account.lamports != 0u64 {
                 ::prost::encoding::uint64::encoded_len(2u32, &account.lamports)
             } else {
                 0
             }
-            + prost_bytes_encoded_len(3u32, account.owner.as_ref())
+            + OWNER_FIELD_ENCODED_LEN
             + if account.executable {
                 ::prost::encoding::bool::encoded_len(4u32, &account.executable)
             } else {
@@ -571,7 +579,7 @@ impl FilteredUpdateAccount {
             }
             + account
                 .txn_signature
-                .map_or(0, |sig| prost_bytes_encoded_len(8u32, sig.as_ref()))
+                .map_or(0, |_| SIGNATURE_FIELD_ENCODED_LEN)
     }
 }
 
@@ -1047,6 +1055,7 @@ pub mod tests {
             },
         },
         bytes::Bytes,
+        foldhash::{HashSet as FoldHashSet, HashSetExt},
         prost_011::Message as _,
         prost_types::Timestamp,
         solana_hash::Hash,
@@ -1055,7 +1064,7 @@ pub mod tests {
         solana_storage_proto::convert::generated,
         solana_transaction_status::{ConfirmedBlock, TransactionWithStatusMeta},
         std::{
-            collections::{HashMap, HashSet},
+            collections::HashMap,
             fs,
             ops::Range,
             str::FromStr,
@@ -1220,8 +1229,10 @@ pub mod tests {
                             transaction: convert_to::create_transaction(&tx.transaction),
                             meta: convert_to::create_transaction_meta(&tx.meta),
                             index,
-                            account_keys: HashSet::new(),
+                            account_keys: FoldHashSet::new(),
                             pre_encoded: OnceLock::new(),
+                            token_owners_all: OnceLock::new(),
+                            token_owners_changed: OnceLock::new(),
                         }
                     })
                     .map(Arc::new)
@@ -1441,6 +1452,8 @@ pub mod tests {
                 index: tx_arc.index,
                 account_keys: tx_arc.account_keys.clone(),
                 pre_encoded: OnceLock::new(),
+                token_owners_all: OnceLock::new(),
+                token_owners_changed: OnceLock::new(),
             };
 
             // Create version without cache (fallback path)
@@ -1452,6 +1465,8 @@ pub mod tests {
                 index: tx_arc.index,
                 account_keys: tx_arc.account_keys.clone(),
                 pre_encoded: OnceLock::new(),
+                token_owners_all: OnceLock::new(),
+                token_owners_changed: OnceLock::new(),
             };
 
             // Pre-encode one of them

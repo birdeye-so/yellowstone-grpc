@@ -1,7 +1,7 @@
-import yargs from "yargs";
 import { inspect } from "node:util";
 import Client, {
   CommitmentLevel,
+  CompressedAccountFilterSet,
   SubscribeDeshredRequest,
   SubscribeRequest,
   SubscribeRequestFilterAccountsFilter,
@@ -10,17 +10,24 @@ import Client, {
   txEncode,
   txErrDecode,
 } from "@triton-one/yellowstone-grpc";
+import type { ReconnectOptions } from "@triton-one/yellowstone-grpc";
 
 async function main() {
-  const args = parseCommandLineArgs();
+  const args = await parseCommandLineArgs();
+  const reconnectOptions = buildReconnectOptions(args);
 
   // Open connection.
-  const client = new Client(args.endpoint, args.xToken, {
-    // "grpc.max_receive_message_length": 64 * 1024 * 1024, // 64MiB
-    grpcMaxDecodingMessageSize: 64 * 1024 * 1024
-  });
+  const client = new Client(
+    args.endpoint,
+    args.xToken,
+    {
+      // "grpc.max_receive_message_length": 64 * 1024 * 1024, // 64MiB
+      grpcMaxDecodingMessageSize: 64 * 1024 * 1024,
+    },
+    reconnectOptions,
+  );
 
-  await client.connect()
+  await client.connect();
 
   const commitment = parseCommitmentLevel(args.commitment);
 
@@ -31,27 +38,29 @@ async function main() {
       break;
 
     case "ping":
-      console.log("response: " + (await client.ping(1)));
+      console.log("response: " + inspect(await client.ping(1)));
       break;
 
     case "get-version":
-      console.log("response: " + (await client.getVersion()));
+      console.log("response: " + inspect(await client.getVersion()));
       break;
 
     case "get-slot":
-      console.log("response: " + (await client.getSlot(commitment)));
+      console.log("response: " + inspect(await client.getSlot(commitment)));
       break;
 
     case "get-block-height":
-      console.log("response: " + (await client.getBlockHeight(commitment)));
+      console.log("response: " + inspect(await client.getBlockHeight(commitment)));
       break;
 
     case "get-latest-blockhash":
-      console.log("response: ", await client.getLatestBlockhash(commitment));
+      console.log("response: " + inspect(await client.getLatestBlockhash(commitment)));
       break;
 
     case "is-blockhash-valid":
-      console.log("response: ", await client.isBlockhashValid(args.blockhash));
+      console.log(
+        "response: " + inspect(await client.isBlockhashValid(String(args.blockhash))),
+      );
       break;
 
     case "subscribe":
@@ -64,7 +73,7 @@ async function main() {
 
     default:
       console.error(
-        `Unknown command: ${args["_"]}. Use "--help" for a list of supported commands.`
+        `Unknown command: ${args["_"]}. Use "--help" for a list of supported commands.`,
       );
       break;
   }
@@ -79,52 +88,70 @@ function parseCommitmentLevel(commitment: string | undefined) {
   return CommitmentLevel[typedCommitment];
 }
 
-async function subscribeCommand(client: Client, args) {
+function buildReconnectOptions(args): ReconnectOptions | undefined {
+  if (!args.autoreconnect) {
+    return undefined;
+  }
 
-  // Subscribe for events
-  const stream = await client.subscribe();
+  return {
+    enabled: true,
+    backoff: {
+      initialIntervalMs: args.autoreconnectInitialIntervalMs,
+      multiplier: args.autoreconnectMultiplier,
+      maxRetries: args.autoreconnectMaxRetries,
+    },
+    slotRetention: args.autoreconnectSlotRetention,
+  };
+}
 
-  // Create `error` / `end` handler
-  const streamClosed = new Promise<void>((resolve, reject) => {
-    stream.on("error", (error) => {
-      reject(error);
-      stream.end();
-    });
-    stream.on("end", () => {
-      resolve();
-    });
-    stream.on("close", () => {
-      resolve();
-    });
-  });
+function stringArray(values: unknown[] | unknown | undefined): string[] {
+  if (values === undefined) {
+    return [];
+  }
+  return (Array.isArray(values) ? values : [values]).map((value) =>
+    String(value),
+  );
+}
 
-  // Handle updates
-  stream.on("data", (data) => {
-    if (
-      data.transaction &&
-      (args.transactionsParsed || args.transactionsDecodeErr)
-    ) {
-      const slot = data.transaction.slot;
-      const message = data.transaction.transaction;
-      if (args.transactionsParsed) {
-        const tx = txEncode.encode(message, txEncode.encoding.Json, 255, true);
-        console.log(
-          `TX filters: ${data.filters}, slot#${slot}, tx: ${JSON.stringify(tx)}`
-        );
-      }
-      if (message.meta.err && args.transactionsDecodeErr) {
-        const err = txErrDecode.decode(message.meta.err.err);
-        console.log(
-          `TX filters: ${data.filters}, slot#${slot}, err: ${inspect(err)}}`
-        );
-      }
-      return;
-    }
+function parsePair(value: unknown, separator: string, optionName: string) {
+  const spec = String(value);
+  const separatorIndex = spec.indexOf(separator);
+  if (separatorIndex <= 0 || separatorIndex === spec.length - 1) {
+    throw new Error(`invalid ${optionName}`);
+  }
 
-    console.log("data", data);
-  });
+  return [
+    spec.slice(0, separatorIndex),
+    spec.slice(separatorIndex + separator.length),
+  ] as const;
+}
 
-  // Create subscribe request based on provided arguments.
+function buildCompressedAccountSet(
+  pubkeys: unknown[] | undefined,
+  maxCapacity: number | undefined,
+  optionName: string,
+): CompressedAccountFilterSet {
+  const trackedPubkeys = stringArray(pubkeys);
+  if (trackedPubkeys.length === 0) {
+    throw new Error(`${optionName} requires at least one pubkey`);
+  }
+
+  const accounts = new CompressedAccountFilterSet(
+    maxCapacity ?? trackedPubkeys.length,
+  );
+  for (const pubkey of trackedPubkeys) {
+    accounts.insert(pubkey);
+  }
+
+  return accounts;
+}
+
+type BuiltSubscribeRequest = {
+  request: SubscribeRequest;
+  accountCompressedFilter?: CompressedAccountFilterSet;
+};
+
+function buildSubscribeRequest(args): BuiltSubscribeRequest {
   const request: SubscribeRequest = {
     accounts: {},
     slots: {},
@@ -137,54 +164,74 @@ async function subscribeCommand(client: Client, args) {
     accountsDataSlice: [],
     ping: undefined,
   };
+  let accountCompressedFilter: CompressedAccountFilterSet | undefined;
+
+  if (args.accountsCompressed && !args.accounts) {
+    throw new Error("--accounts-compressed requires --accounts");
+  }
+
+  if (args.blocksCompressed && !args.blocks) {
+    throw new Error("--blocks-compressed requires --blocks");
+  }
+
+  if (args.accountsCompressed) {
+    accountCompressedFilter = buildCompressedAccountSet(
+      args.accountsAccount,
+      args.accountsCompressedCapacity,
+      "--accounts-compressed",
+    );
+  }
+
+  const blockCompressedFilter = args.blocksCompressed
+    ? buildCompressedAccountSet(
+        args.blocksAccountInclude,
+        args.blocksCompressedCapacity,
+        "--blocks-compressed",
+      )
+    : undefined;
+
   if (args.accounts) {
     const filters: SubscribeRequestFilterAccountsFilter[] = [];
 
-    if (args.accounts.memcmp) {
-      for (let filter in args.accounts.memcmp) {
-        const filterSpec = filter.split(",", 1);
-        if (filterSpec.length != 2) {
-          throw new Error("invalid memcmp");
-        }
-
-        const [offset, data] = filterSpec;
+    if (args.accountsMemcmp) {
+      for (const filter of stringArray(args.accountsMemcmp)) {
+        const [offset, data] = parsePair(filter, ",", "memcmp");
         filters.push({
           memcmp: { offset, base58: data.trim() },
         });
       }
     }
 
-    if (args.accounts.tokenaccountstate) {
+    if (args.accountsTokenaccountstate) {
       filters.push({
-        tokenAccountState: args.accounts.tokenaccountstate,
+        tokenAccountState: args.accountsTokenaccountstate,
       });
     }
 
-    if (args.accounts.datasize) {
-      filters.push({ datasize: args.accounts.datasize });
+    if (args.accountsDatasize) {
+      filters.push({ datasize: String(args.accountsDatasize) });
     }
 
-    if (args.accounts.lamports) {
-      for (let filter in args.accounts.lamports) {
-        const filterSpec = filter.split(":", 1);
-        if (filterSpec.length != 2) {
-          throw new Error("invalid lamports");
-        }
-
-        const [cmp, value] = filterSpec;
+    if (args.accountsLamports) {
+      for (const filter of stringArray(args.accountsLamports)) {
+        const [cmp, value] = parsePair(filter, ":", "lamports");
         let lamports: SubscribeRequestFilterAccountsFilterLamports = {};
         switch (cmp) {
           case "eq": {
             lamports.eq = value;
+            break;
           }
           case "ne": {
             lamports.ne = value;
+            break;
           }
           case "lt": {
             lamports.lt = value;
+            break;
           }
           case "gt": {
             lamports.gt = value;
+            break;
           }
           default:
             throw new Error("invalid lamports cmp");
@@ -196,11 +243,13 @@ async function subscribeCommand(client: Client, args) {
     }
 
     request.accounts.client = {
-      account: args.accountsAccount,
-      owner: args.accountsOwner,
+      ...(accountCompressedFilter?.toAccountFilter() ?? {}),
+      account: accountCompressedFilter ? [] : stringArray(args.accountsAccount),
+      owner: stringArray(args.accountsOwner),
       filters,
       nonemptyTxnSignature: args.accountsNonemptytxnsignature,
     };
+
   }
 
   if (args.slots) {
@@ -237,27 +286,24 @@ async function subscribeCommand(client: Client, args) {
 
   if (args.blocks) {
     request.blocks.client = {
-      accountInclude: args.blocksAccountInclude,
+      ...(blockCompressedFilter?.toBlockFilter() ?? {}),
+      accountInclude: blockCompressedFilter
+        ? []
+        : stringArray(args.blocksAccountInclude),
       includeTransactions: args.blocksIncludeTransactions,
       includeAccounts: args.blocksIncludeAccounts,
       includeEntries: args.blocksIncludeEntries,
     };
+
   }
 
   if (args.blocksMeta) {
-    request.blocksMeta.client = {
-      account_include: args.blocksAccountInclude,
-    };
+    request.blocksMeta.client = {};
   }
 
-  if (args.accounts.dataslice) {
-    for (let filter in args.accounts.dataslice) {
-      const filterSpec = filter.split(",", 1);
-      if (filterSpec.length != 2) {
-        throw new Error("invalid data slice");
-      }
-
-      const [offset, length] = filterSpec;
+  if (args.accountsDataslice) {
+    for (const filter of stringArray(args.accountsDataslice)) {
+      const [offset, length] = parsePair(filter, ",", "data slice");
       request.accountsDataSlice.push({
         offset,
         length,
@@ -269,19 +315,81 @@ async function subscribeCommand(client: Client, args) {
     request.ping = { id: args.ping };
   }
 
-  // Send subscribe request
-  await new Promise<void>((resolve, reject) => {
-    stream.write(request, (err) => {
-      if (err === null || err === undefined) {
-        resolve();
-      } else {
-        reject(err);
-      }
+  return { request, accountCompressedFilter };
+}
+
+async function subscribeCommand(client: Client, args) {
+  // Create subscribe request based on provided arguments.
+  const { request, accountCompressedFilter } = buildSubscribeRequest(args);
+
+  // Subscribe for events. When auto-reconnect is enabled, pass the initial
+  // request at stream creation so reconnects can resume that subscription.
+  const stream = args.autoreconnect
+    ? await client.subscribe(request)
+    : await client.subscribe();
+
+  // Create `error` / `end` handler
+  const streamClosed = new Promise<void>((resolve, reject) => {
+    stream.on("error", (error) => {
+      reject(error);
+      stream.end();
     });
-  }).catch((reason) => {
-    console.error(reason);
-    throw reason;
+    stream.on("end", () => {
+      resolve();
+    });
+    stream.on("close", () => {
+      resolve();
+    });
   });
+
+  // Handle updates
+  stream.on("data", (data) => {
+    if (
+      data.transaction &&
+      (args.transactionsParsed || args.transactionsDecodeErr)
+    ) {
+      const slot = data.transaction.slot;
+      const message = data.transaction.transaction;
+      if (args.transactionsParsed) {
+        const tx = txEncode.encode(message, txEncode.encoding.Json, 255, true);
+        console.log(
+          `TX filters: ${data.filters}, slot#${slot}, tx: ${JSON.stringify(tx)}`,
+        );
+      }
+      if (message.meta.err && args.transactionsDecodeErr) {
+        const err = txErrDecode.decode(message.meta.err.err);
+        console.log(
+          `TX filters: ${data.filters}, slot#${slot}, err: ${inspect(err)}}`,
+        );
+      }
+      return;
+    }
+
+    if (accountCompressedFilter && data.account) {
+      const pubkey = data.account.account?.pubkey;
+      if (!pubkey || !accountCompressedFilter.contains(pubkey)) {
+        return;
+      }
+    }
+
+    console.log("data", data);
+  });
+
+  // Send subscribe request
+  if (!args.autoreconnect) {
+    await new Promise<void>((resolve, reject) => {
+      stream.write(request, (err) => {
+        if (err === null || err === undefined) {
+          resolve();
+        } else {
+          reject(err);
+        }
+      });
+    }).catch((reason) => {
+      console.error(reason);
+      throw reason;
+    });
+  }
 
   await streamClosed;
 }
@@ -317,12 +425,12 @@ async function subscribeDeshredCommand(client: Client, args) {
           txDeshredEncode.encoding.JsonParsed,
         );
         console.log(
-          `DESHRED filters: ${data.filters}, slot#${data.deshredTransaction.slot}, tx: ${JSON.stringify(tx)}`
+          `DESHRED filters: ${data.filters}, slot#${data.deshredTransaction.slot}, tx: ${JSON.stringify(tx)}`,
         );
       } catch (error) {
         console.error(
           `failed to parse deshred tx (slot#${data.deshredTransaction.slot})`,
-          error
+          error,
         );
       }
       return;
@@ -330,7 +438,7 @@ async function subscribeDeshredCommand(client: Client, args) {
 
     console.log("data", data);
   });
-  
+
   const request: SubscribeDeshredRequest = {
     deshredTransactions: {
       client: {
@@ -341,6 +449,7 @@ async function subscribeDeshredCommand(client: Client, args) {
       },
     },
     ping: args.ping ? { id: args.ping } : undefined,
+    slots: {},
   };
 
   await new Promise<void>((resolve, reject) => {
@@ -359,7 +468,9 @@ async function subscribeDeshredCommand(client: Client, args) {
   await streamClosed;
 }
 
-function parseCommandLineArgs() {
+async function parseCommandLineArgs() {
+  const { default: yargs } = await import("yargs");
+
   return yargs(process.argv.slice(2))
     .options({
       endpoint: {
@@ -375,6 +486,31 @@ function parseCommandLineArgs() {
       commitment: {
         describe: "commitment level",
         choices: ["processed", "confirmed", "finalized"],
+      },
+      autoreconnect: {
+        default: false,
+        describe: "enable auto-reconnect for standard subscribe streams",
+        type: "boolean",
+      },
+      "autoreconnect-initial-interval-ms": {
+        default: 10,
+        describe: "auto-reconnect first retry delay in milliseconds",
+        type: "number",
+      },
+      "autoreconnect-multiplier": {
+        default: 2,
+        describe: "auto-reconnect exponential backoff multiplier",
+        type: "number",
+      },
+      "autoreconnect-max-retries": {
+        default: 3,
+        describe: "auto-reconnect retry count per reconnect attempt",
+        type: "number",
+      },
+      "autoreconnect-slot-retention": {
+        default: 250,
+        describe: "slots retained for auto-reconnect deduplication",
+        type: "number",
       },
     })
     .command("subscribe-replay-info", "get subscribe replay info")
@@ -393,7 +529,7 @@ function parseCommandLineArgs() {
             demandOption: true,
           },
         });
-      }
+      },
     )
     .command("subscribe", "subscribe to events", (yargs) => {
       return yargs.options({
@@ -406,6 +542,17 @@ function parseCommandLineArgs() {
           default: [],
           describe: "filter by account pubkey",
           type: "array",
+        },
+        "accounts-compressed": {
+          default: false,
+          describe:
+            "send --accounts-account pubkeys as a compressed account filter",
+          type: "boolean",
+        },
+        "accounts-compressed-capacity": {
+          describe:
+            "max capacity for --accounts-compressed; defaults to number of --accounts-account values",
+          type: "number",
         },
         "accounts-owner": {
           default: [],
@@ -442,7 +589,7 @@ function parseCommandLineArgs() {
           default: [],
           describe:
             "receive only part of updated data account, format: `offset,size`",
-          type: "string",
+          type: "array",
         },
         slots: {
           default: false,
@@ -543,6 +690,17 @@ function parseCommandLineArgs() {
           description: "filter included account in transactions",
           type: "array",
         },
+        "blocks-compressed": {
+          default: false,
+          description:
+            "send --blocks-account-include pubkeys as a compressed account filter",
+          type: "boolean",
+        },
+        "blocks-compressed-capacity": {
+          description:
+            "max capacity for --blocks-compressed; defaults to number of --blocks-account-include values",
+          type: "number",
+        },
         "blocks-include-transactions": {
           default: false,
           description: "include transactions to block messsage",
@@ -570,44 +728,49 @@ function parseCommandLineArgs() {
         },
       });
     })
-    .command("subscribeDeshred", "subscribe to deshred transactions", (yargs) => {
-      return yargs.options({
-        "deshred-parsed": {
-          default: false,
-          describe: "parse deshred transactions using txDeshredEncode",
-          type: "boolean",
-        },
-        "deshred-vote": {
-          description: "filter vote transactions",
-          type: "boolean",
-        },
-        "deshred-account-include": {
-          default: [],
-          description:
-            "filter included accounts in deshred transactions (static + ALT)",
-          type: "array",
-        },
-        "deshred-account-exclude": {
-          default: [],
-          description:
-            "filter excluded accounts in deshred transactions (static + ALT)",
-          type: "array",
-        },
-        "deshred-account-required": {
-          default: [],
-          description:
-            "filter required accounts in deshred transactions (static + ALT)",
-          type: "array",
-        },
-        ping: {
-          default: undefined,
-          description: "send ping request in subscribeDeshred",
-          type: "number",
-        },
-      });
-    })
+    .command(
+      "subscribeDeshred",
+      "subscribe to deshred transactions",
+      (yargs) => {
+        return yargs.options({
+          "deshred-parsed": {
+            default: false,
+            describe: "parse deshred transactions using txDeshredEncode",
+            type: "boolean",
+          },
+          "deshred-vote": {
+            description: "filter vote transactions",
+            type: "boolean",
+          },
+          "deshred-account-include": {
+            default: [],
+            description:
+              "filter included accounts in deshred transactions (static + ALT)",
+            type: "array",
+          },
+          "deshred-account-exclude": {
+            default: [],
+            description:
+              "filter excluded accounts in deshred transactions (static + ALT)",
+            type: "array",
+          },
+          "deshred-account-required": {
+            default: [],
+            description:
+              "filter required accounts in deshred transactions (static + ALT)",
+            type: "array",
+          },
+          ping: {
+            default: undefined,
+            description: "send ping request in subscribeDeshred",
+            type: "number",
+          },
+        });
+      },
+    )
     .demandCommand(1)
-    .help().argv;
+    .help()
+    .parseSync();
 }
 
 main();

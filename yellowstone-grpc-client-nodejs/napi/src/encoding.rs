@@ -1,7 +1,7 @@
 use {
   napi::Status,
   napi_derive::napi,
-  prost011::Message as Prost11Message,
+  prost_011::Message as Prost11Message,
   serde::Serialize,
   solana_storage_proto::convert::generated::{
     Transaction as StorageTransaction, TransactionStatusMeta as StorageTransactionStatusMeta,
@@ -274,6 +274,8 @@ mod tests {
       transaction: None,
       loaded_writable_addresses: Vec::new(),
       loaded_readonly_addresses: Vec::new(),
+      completed_data_set_starting_shred_index: 0,
+      completed_data_set_ending_shred_index_exclusive: 0,
     }
     .encode_to_vec();
 

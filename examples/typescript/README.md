@@ -26,6 +26,24 @@ npm start -- --endpoint https://api.rpcpool.com \
   --accounts --accounts-account "<Pubkey>"
 ```
 
+### subscribe to account updates with a compressed account set
+
+Use the same `subscribe` command and `--accounts-account` inputs. Adding
+`--accounts-compressed` sends those pubkeys as a compressed cuckoo filter instead
+of an explicit account list. Account updates are still printed as `data ...`;
+the example drops cuckoo false positives with the local exact account set before
+printing.
+
+```shell
+npm start -- --endpoint https://api.rpcpool.com \
+  --x-token "<token>" \
+  subscribe \
+  --accounts \
+  --accounts-compressed \
+  --accounts-compressed-capacity 100000 \
+  --accounts-account "<Pubkey>"
+```
+
 ### subscribe to slot updates
 
 ```shell
@@ -42,6 +60,68 @@ npm start -- --endpoint http://sg131.rpcpool.wg:10000 \
   subscribe \
   --slots
 ```
+
+### subscribe with auto-reconnect
+
+Auto-reconnect is opt-in and applies to standard `subscribe` streams. It reconnects after recoverable stream failures, replays from the last completed slot checkpoint, and deduplicates replayed updates before they reach the TypeScript stream.
+
+```shell
+npm start -- --endpoint https://api.rpcpool.com \
+  --x-token "<token>" \
+  --autoreconnect \
+  subscribe \
+  --slots
+```
+
+Backoff and slot retention can be configured from the example CLI:
+
+```shell
+npm start -- --endpoint https://api.rpcpool.com \
+  --x-token "<token>" \
+  --autoreconnect \
+  --autoreconnect-initial-interval-ms 100 \
+  --autoreconnect-multiplier 2 \
+  --autoreconnect-max-retries 10 \
+  --autoreconnect-slot-retention 250 \
+  subscribe \
+  --slots
+```
+
+The same setup in application code passes reconnect options as the fourth `Client` constructor argument. Passing the request to `subscribe(request)` sends the initial subscription when the stream opens.
+
+```ts
+const client = new Client(
+  "https://api.rpcpool.com",
+  "<token>",
+  { grpcMaxDecodingMessageSize: 64 * 1024 * 1024 },
+  {
+    enabled: true,
+    backoff: {
+      initialIntervalMs: 100,
+      multiplier: 2,
+      maxRetries: 10,
+    },
+    slotRetention: 250,
+  },
+);
+
+await client.connect();
+
+const stream = await client.subscribe({
+  accounts: {},
+  slots: { client: { filterByCommitment: false } },
+  transactions: {},
+  transactionsStatus: {},
+  entry: {},
+  blocks: {},
+  blocksMeta: {},
+  accountsDataSlice: [],
+  commitment: undefined,
+  ping: undefined,
+});
+```
+
+If reconnect options are omitted, the client keeps the original non-reconnecting behavior. `subscribeDeshred` is not covered by auto-reconnect.
 
 ### subscribe to slot updates, commitment processed
 
@@ -63,6 +143,22 @@ npm start -- -e="https://api.rpcpool.com" \
   --transactions-vote false \
   --transactions-failed false \
   --transactions-account-include "<Pubkey>"
+```
+
+### subscribe to block updates with a compressed account include set
+
+Use the same `--blocks-account-include` input as the explicit block filter.
+Adding `--blocks-compressed` sends the included accounts as a compressed cuckoo
+filter.
+
+```shell
+npm start -- -e="https://api.rpcpool.com" \
+  --x-token "<token>" \
+  subscribe \
+  --blocks \
+  --blocks-compressed \
+  --blocks-compressed-capacity 100000 \
+  --blocks-account-include "<Pubkey>"
 ```
 
 ### subscribe to deshred transaction updates

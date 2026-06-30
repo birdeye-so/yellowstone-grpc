@@ -3,7 +3,6 @@ use {
         config::Config,
         grpc::GrpcService,
         metrics::{self, incr_geyser_event_dropped, PrometheusService},
-        parallel::ParallelEncoder,
         plugin::{
             filter::limits::FilterLimits,
             message::{
@@ -22,7 +21,7 @@ use {
         concat, env,
         sync::{
             atomic::{AtomicBool, Ordering},
-            Arc, Mutex,
+            Arc, Mutex, Once,
         },
         time::Duration,
     },
@@ -30,6 +29,7 @@ use {
         runtime::{Builder, Runtime},
         sync::mpsc,
     },
+    tokio_rustls::rustls,
     tokio_util::{sync::CancellationToken, task::TaskTracker},
 };
 
@@ -118,10 +118,13 @@ impl GeyserPlugin for Plugin {
             .build()
             .map_err(|error| GeyserPluginError::Custom(Box::new(error)))?;
 
-        let encoder_threads = config.grpc.encoder_threads;
-        let (encoder, encoder_handle) = ParallelEncoder::new(encoder_threads);
-
         let result = runtime.block_on(async move {
+            static CRYPTO_PROVIDER_INIT: Once = Once::new();
+
+            CRYPTO_PROVIDER_INIT.call_once(|| {
+                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            });
+
             let (debug_client_tx, debug_client_rx) = mpsc::unbounded_channel();
             // Create prometheus service First so if it fails the plugin doesn't spawn geyser tasks unnecessarily.
             PrometheusService::spawn(
@@ -139,7 +142,6 @@ impl GeyserPlugin for Plugin {
                 is_reload,
                 grpc_cancellation_token,
                 grpc_task_tracker,
-                encoder,
             )
             .await
             .map_err(|error| GeyserPluginError::Custom(format!("{error:?}").into()))?;
@@ -152,7 +154,6 @@ impl GeyserPlugin for Plugin {
                 log::error!("failed to start plugin services: {e}");
                 plugin_cancellation_token.cancel();
                 // join before returning because encoder already dropped, channel closed
-                let _ = encoder_handle.join();
                 return Err(GeyserPluginError::Custom(format!("{e:?}").into()));
             }
         };
@@ -187,9 +188,6 @@ impl GeyserPlugin for Plugin {
             );
             inner.runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
             log::info!("tokio runtime shut down in {:?}", now.elapsed());
-            if let Err(e) = inner.encoder_handle.join() {
-                log::error!("encoder thread panicked: {:?}", e);
-            }
             log::info!("plugin shutdown complete");
         }
     }

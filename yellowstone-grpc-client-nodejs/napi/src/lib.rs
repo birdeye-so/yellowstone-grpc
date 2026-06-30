@@ -6,11 +6,12 @@
 //! - gRPC stream (`SubscribeUpdate`) -> JS reads
 //!
 //! Design goals:
-//! - Keep JS-facing API small and stable (`read` / `write`)
-//! - Convert all protobuf <-> JS objects through generated `js_types`
+//! - Keep JS-facing API small and stable (`read` / `write_raw`)
+//! - Pass protobuf payload bytes over the N-API boundary
 //! - Stop worker tasks deterministically when JS drops stream handles
 mod bindings;
 mod client;
+mod cuckoo;
 mod encoding;
 mod subscribe_request_validation;
 mod utils;
@@ -29,17 +30,12 @@ use tokio::sync::{
 };
 use yellowstone_grpc_proto::prelude::*;
 
-use crate::{
-  client::GrpcClient,
-  js_types::{
-    JsSubscribeDeshredRequest, JsSubscribeRequest, JsSubscribeUpdate, JsSubscribeUpdateDeshred,
-  },
-  subscribe_request_validation::validate_subscribe_request,
-};
-
-pub mod js_types;
+use crate::{client::GrpcClient, subscribe_request_validation::validate_subscribe_request};
 
 static INITIALIZE_CRYPTO_PROVIDER: Once = Once::new();
+
+#[napi(js_name = "AUTORECONNECT_FILTER_KEY")]
+pub const AUTORECONNECT_FILTER_KEY: &str = "__autoreconnect";
 
 /// Initialize crypto provider once.
 fn init_crypto_provider() {
@@ -95,6 +91,14 @@ fn napi_error(status: napi::Status, reason: impl Into<String>) -> napi::Error {
   error
 }
 
+fn strip_autoreconnect_filter(update: &mut SubscribeUpdate) -> bool {
+  let before = update.filters.len();
+  update
+    .filters
+    .retain(|filter| filter != AUTORECONNECT_FILTER_KEY);
+  before != update.filters.len()
+}
+
 /// DuplexStream Engine
 ///
 /// The inner engine for a custom implementation of stream.Duplex
@@ -105,13 +109,13 @@ fn napi_error(status: napi::Status, reason: impl Into<String>) -> napi::Error {
 /// will `_read()` from and `_write()` to.
 #[napi]
 struct DuplexStream {
-  /// Read side consumed by `read()`. Each message is delivered exactly once.
-  readable: Arc<Mutex<UnboundedReceiver<SubscribeUpdate>>>,
-  /// Write side used by `write()`. Requests are forwarded to gRPC task.
+  /// Read side consumed by `read()`. Each protobuf payload is delivered exactly once.
+  readable: Arc<Mutex<UnboundedReceiver<Vec<u8>>>>,
+  /// Write side used by `write_raw()`. Requests are forwarded to gRPC task.
   ///
   /// The mutex protects a close-state transition, not sender sharing:
   /// - `close()` sets the state to `None` (revokes future writes).
-  /// - `write()` reads/clones under the same lock.
+  /// - `write_raw()` reads/clones under the same lock.
   ///
   /// `UnboundedSender` being cheap-`Clone` is true, but clone alone does not
   /// provide an atomic "disable writes now" transition.
@@ -130,7 +134,24 @@ impl DuplexStream {
   pub fn subscribe<'env>(
     env: &'env Env,
     grpc_client: &GrpcClient,
+    initial_request_bytes: Option<Buffer>,
   ) -> Result<PromiseRaw<'env, Self>> {
+    let initial_request = match initial_request_bytes {
+      Some(request_bytes) => {
+        let request = SubscribeRequest::decode(request_bytes.as_ref()).map_err(|error| {
+          napi_error_with_cause(
+            napi::Status::InvalidArg,
+            "invalid SubscribeRequest payload",
+            &error,
+          )
+        })?;
+        validate_subscribe_request(&request).map_err(|error| {
+          napi_error_with_cause(napi::Status::InvalidArg, error.to_string(), &error)
+        })?;
+        Some(request)
+      }
+      None => None,
+    };
     let mut client = grpc_client.client.clone();
 
     // Open the gRPC stream before returning to JS so connection/protocol errors
@@ -139,17 +160,20 @@ impl DuplexStream {
       async move {
         // Acquire lock, call subscribe, and immediately release the lock.
         let (mut stream_tx, mut stream_rx) = {
-          client.subscribe().await.map_err(|error| {
-            napi_error_with_cause(
-              napi::Status::GenericFailure,
-              "failed to open subscribe stream",
-              &error,
-            )
-          })?
+          client
+            .subscribe_with_request(initial_request)
+            .await
+            .map_err(|error| {
+              napi_error_with_cause(
+                napi::Status::GenericFailure,
+                "failed to open subscribe stream",
+                &error,
+              )
+            })?
         };
 
         // TODO : Fine tune unbounded channels.
-        let (readable_tx, readable_rx) = unbounded_channel::<SubscribeUpdate>();
+        let (readable_tx, readable_rx) = unbounded_channel::<Vec<u8>>();
         let (writable_tx, mut writable_rx) = unbounded_channel::<SubscribeRequest>();
         let writable = Arc::new(StdMutex::new(Some(writable_tx)));
         let terminal_error = Arc::new(StdMutex::new(None));
@@ -165,7 +189,7 @@ impl DuplexStream {
         tokio::spawn(async move {
           loop {
             tokio::select! {
-              // 1. SubscribeRequest is received from self.write().
+              // 1. SubscribeRequest is received from self.write_raw().
               // 2. SubscribeRequest is propagated to Geyser client's sender.
               req_option = writable_rx.recv() => {
                 if let Some(request) = req_option {
@@ -196,9 +220,16 @@ impl DuplexStream {
               // 2. SubscribeUpdate is propagated to self.read() for NodeJS consumption.
               maybe_update_result = stream_rx.next() => {
                 match maybe_update_result {
-                  Some(Ok(update)) => {
+                  Some(Ok(mut update)) => {
+                    let stripped = strip_autoreconnect_filter(&mut update);
+                    if stripped && update.filters.is_empty() {
+                      continue;
+                    }
+
+                    let update_bytes = update.encode_to_vec();
+
                     // JS reader side disappeared; no point continuing the worker.
-                    if readable_tx.send(update).is_err() {
+                    if readable_tx.send(update_bytes).is_err() {
                       break;
                     }
                   }
@@ -238,31 +269,19 @@ impl DuplexStream {
 
   /// Read JS Accesspoint.
   ///
-  /// Retrieve one `SubscribeUpdate` from the worker and convert it to
-  /// the generated N-API JS representation (`JsSubscribeUpdate`).
+  /// Retrieve one encoded `SubscribeUpdate` payload from the worker.
   #[napi]
-  pub fn read<'env>(
-    &self,
-    env: &'env Env,
-  ) -> Result<PromiseRaw<'env, Option<JsSubscribeUpdate<'env>>>> {
+  pub fn read<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, Option<Buffer>>> {
     let readable = self.readable.clone();
     let terminal_error = self.terminal_error.clone();
 
     env.spawn_future_with_callback(
       async move { Self::recv_update_or_error(readable, terminal_error).await },
-      move |environment, subscribe_update_opt| match subscribe_update_opt {
-        Some(subscribe_update) => {
-          JsSubscribeUpdate::from_protobuf_to_js_type(environment, subscribe_update).map(Some)
-        }
-        None => Ok(None),
-      },
+      move |_environment, update_bytes_opt| Ok(update_bytes_opt.map(Buffer::from)),
     )
   }
 
-  /// Write JS Accesspoint.
-  ///
-  /// Accept a JS request object, convert to protobuf, then enqueue for the
-  /// worker to forward to the gRPC request sink.
+  /// Close the stream and reject future writes.
   #[napi]
   pub fn close(&self) -> Result<()> {
     self.is_closing.store(true, Ordering::Release);
@@ -279,16 +298,6 @@ impl DuplexStream {
     *writable_guard = None;
 
     Ok(())
-  }
-
-  #[napi]
-  pub fn write(&self, request: JsSubscribeRequest) -> Result<()> {
-    let protobuf_subscribe_request: SubscribeRequest = request.from_js_to_protobuf_type()?;
-    validate_subscribe_request(&protobuf_subscribe_request).map_err(|error| {
-      napi_error_with_cause(napi::Status::InvalidArg, error.to_string(), &error)
-    })?;
-
-    self.enqueue_subscribe_request(protobuf_subscribe_request)
   }
 
   #[napi]
@@ -347,9 +356,9 @@ impl DuplexStream {
   }
 
   async fn recv_update_or_error(
-    readable: Arc<Mutex<UnboundedReceiver<SubscribeUpdate>>>,
+    readable: Arc<Mutex<UnboundedReceiver<Vec<u8>>>>,
     terminal_error: Arc<StdMutex<Option<napi::Error>>>,
-  ) -> Result<Option<SubscribeUpdate>> {
+  ) -> Result<Option<Vec<u8>>> {
     match readable.lock().await.recv().await {
       Some(update) => Ok(Some(update)),
       // Channel close indicates worker termination. If worker captured a native
@@ -374,9 +383,9 @@ impl DuplexStream {
 /// Similar to `DuplexStream`, but targets the deshred pre-execution stream.
 #[napi]
 struct DuplexStreamDeshred {
-  /// Read side consumed by `read()`. Each message is delivered exactly once.
-  readable: Arc<Mutex<UnboundedReceiver<SubscribeUpdateDeshred>>>,
-  /// Write side used by `write()`. Requests are forwarded to gRPC task.
+  /// Read side consumed by `read()`. Each protobuf payload is delivered exactly once.
+  readable: Arc<Mutex<UnboundedReceiver<Vec<u8>>>>,
+  /// Write side used by `write_raw()`. Requests are forwarded to gRPC task.
   writable: Arc<StdMutex<Option<UnboundedSender<SubscribeDeshredRequest>>>>,
   /// Terminal worker error captured from gRPC send/recv failures.
   ///
@@ -409,7 +418,7 @@ impl DuplexStreamDeshred {
           })?
         };
 
-        let (readable_tx, readable_rx) = unbounded_channel::<SubscribeUpdateDeshred>();
+        let (readable_tx, readable_rx) = unbounded_channel::<Vec<u8>>();
         let (writable_tx, mut writable_rx) = unbounded_channel::<SubscribeDeshredRequest>();
         let writable = Arc::new(StdMutex::new(Some(writable_tx)));
         let terminal_error = Arc::new(StdMutex::new(None));
@@ -447,7 +456,7 @@ impl DuplexStreamDeshred {
               maybe_update_result = stream_rx.next() => {
                 match maybe_update_result {
                   Some(Ok(update)) => {
-                    if readable_tx.send(update).is_err() {
+                    if readable_tx.send(update.encode_to_vec()).is_err() {
                       break;
                     }
                   }
@@ -484,24 +493,15 @@ impl DuplexStreamDeshred {
     )
   }
 
-  /// Retrieve one `SubscribeUpdateDeshred` and convert it to generated N-API JS shape.
+  /// Retrieve one encoded `SubscribeUpdateDeshred` payload.
   #[napi]
-  pub fn read<'env>(
-    &self,
-    env: &'env Env,
-  ) -> Result<PromiseRaw<'env, Option<JsSubscribeUpdateDeshred<'env>>>> {
+  pub fn read<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, Option<Buffer>>> {
     let readable = self.readable.clone();
     let terminal_error = self.terminal_error.clone();
 
     env.spawn_future_with_callback(
       async move { Self::recv_update_or_error(readable, terminal_error).await },
-      move |environment, subscribe_update_opt| match subscribe_update_opt {
-        Some(subscribe_update) => {
-          JsSubscribeUpdateDeshred::from_protobuf_to_js_type(environment, subscribe_update)
-            .map(Some)
-        }
-        None => Ok(None),
-      },
+      move |_environment, update_bytes_opt| Ok(update_bytes_opt.map(Buffer::from)),
     )
   }
 
@@ -519,12 +519,6 @@ impl DuplexStreamDeshred {
     *writable_guard = None;
 
     Ok(())
-  }
-
-  #[napi]
-  pub fn write(&self, request: JsSubscribeDeshredRequest) -> Result<()> {
-    let protobuf_subscribe_request: SubscribeDeshredRequest = request.from_js_to_protobuf_type()?;
-    self.enqueue_subscribe_request(protobuf_subscribe_request)
   }
 
   #[napi]
@@ -582,9 +576,9 @@ impl DuplexStreamDeshred {
   }
 
   async fn recv_update_or_error(
-    readable: Arc<Mutex<UnboundedReceiver<SubscribeUpdateDeshred>>>,
+    readable: Arc<Mutex<UnboundedReceiver<Vec<u8>>>>,
     terminal_error: Arc<StdMutex<Option<napi::Error>>>,
-  ) -> Result<Option<SubscribeUpdateDeshred>> {
+  ) -> Result<Option<Vec<u8>>> {
     match readable.lock().await.recv().await {
       Some(update) => Ok(Some(update)),
       None => {
@@ -604,13 +598,7 @@ impl DuplexStreamDeshred {
 
 #[cfg(test)]
 mod tests {
-  use crate::{
-    js_types::{
-      JsSubscribeDeshredRequest, JsSubscribeRequest, JsSubscribeRequestAccountsDataSlice,
-      JsSubscribeRequestFilterDeshredTransactions, JsSubscribeRequestPing,
-    },
-    DuplexStream, DuplexStreamDeshred,
-  };
+  use crate::{DuplexStream, DuplexStreamDeshred};
   use napi::bindgen_prelude::Buffer;
   use napi::Status;
   use prost::Message;
@@ -630,11 +618,15 @@ mod tests {
     SubscribeDeshredRequest, SubscribeRequest, SubscribeRequestFilterAccounts,
     SubscribeRequestFilterAccountsFilter, SubscribeRequestFilterAccountsFilterLamports,
     SubscribeRequestFilterAccountsFilterMemcmp, SubscribeRequestFilterDeshredTransactions,
-    SubscribeUpdate, SubscribeUpdateDeshred,
+    SubscribeRequestPing, SubscribeUpdate,
   };
 
-  fn empty_subscribe_request() -> JsSubscribeRequest<'static> {
-    JsSubscribeRequest {
+  fn encode_buffer<M: Message>(message: &M) -> Buffer {
+    Buffer::from(message.encode_to_vec())
+  }
+
+  fn empty_subscribe_request() -> SubscribeRequest {
+    SubscribeRequest {
       accounts: HashMap::new(),
       slots: HashMap::new(),
       transactions: HashMap::new(),
@@ -649,10 +641,11 @@ mod tests {
     }
   }
 
-  fn empty_subscribe_deshred_request() -> JsSubscribeDeshredRequest {
-    JsSubscribeDeshredRequest {
+  fn empty_subscribe_deshred_request() -> SubscribeDeshredRequest {
+    SubscribeDeshredRequest {
       deshred_transactions: HashMap::new(),
       ping: None,
+      slots: HashMap::new(),
     }
   }
 
@@ -674,6 +667,7 @@ mod tests {
           )),
         }],
         nonempty_txn_signature: None,
+        cuckoo_accounts_filter: None,
       },
     );
 
@@ -737,7 +731,7 @@ mod tests {
     DuplexStream,
     tokio::sync::mpsc::UnboundedReceiver<SubscribeRequest>,
   ) {
-    let (_readable_tx, readable_rx) = unbounded_channel::<SubscribeUpdate>();
+    let (_readable_tx, readable_rx) = unbounded_channel::<Vec<u8>>();
     let (writable_tx, writable_rx) = unbounded_channel::<SubscribeRequest>();
 
     (
@@ -755,7 +749,7 @@ mod tests {
     DuplexStreamDeshred,
     tokio::sync::mpsc::UnboundedReceiver<SubscribeDeshredRequest>,
   ) {
-    let (_readable_tx, readable_rx) = unbounded_channel::<SubscribeUpdateDeshred>();
+    let (_readable_tx, readable_rx) = unbounded_channel::<Vec<u8>>();
     let (writable_tx, writable_rx) = unbounded_channel::<SubscribeDeshredRequest>();
 
     (
@@ -776,6 +770,44 @@ mod tests {
       cause_message.to_string(),
     ));
     error
+  }
+
+  fn subscribe_update_with_filters(filters: &[&str]) -> SubscribeUpdate {
+    SubscribeUpdate {
+      filters: filters.iter().map(|filter| (*filter).to_string()).collect(),
+      update_oneof: None,
+      created_at: None,
+    }
+  }
+
+  #[test]
+  fn strip_autoreconnect_filter_removes_internal_filter_from_mixed_update() {
+    let mut update = subscribe_update_with_filters(&[crate::AUTORECONNECT_FILTER_KEY, "client"]);
+
+    let stripped = super::strip_autoreconnect_filter(&mut update);
+
+    assert!(stripped);
+    assert_eq!(update.filters, vec!["client".to_string()]);
+  }
+
+  #[test]
+  fn strip_autoreconnect_filter_leaves_internal_only_update_empty() {
+    let mut update = subscribe_update_with_filters(&[crate::AUTORECONNECT_FILTER_KEY]);
+
+    let stripped = super::strip_autoreconnect_filter(&mut update);
+
+    assert!(stripped);
+    assert!(update.filters.is_empty());
+  }
+
+  #[test]
+  fn strip_autoreconnect_filter_does_not_mark_naturally_empty_update_internal() {
+    let mut update = subscribe_update_with_filters(&[]);
+
+    let stripped = super::strip_autoreconnect_filter(&mut update);
+
+    assert!(!stripped);
+    assert!(update.filters.is_empty());
   }
 
   #[tokio::test]
@@ -801,8 +833,8 @@ mod tests {
     stream.close().expect("close should succeed");
 
     let error = stream
-      .write(empty_subscribe_request())
-      .expect_err("write should fail after close");
+      .write_raw(encode_buffer(&empty_subscribe_request()))
+      .expect_err("write_raw should fail after close");
 
     assert!(
       error
@@ -826,8 +858,8 @@ mod tests {
     });
 
     stream
-      .write(empty_subscribe_request())
-      .expect("initial write should succeed");
+      .write_raw(encode_buffer(&empty_subscribe_request()))
+      .expect("initial write_raw should succeed");
     stream.close().expect("close should succeed");
 
     timeout(Duration::from_secs(1), worker)
@@ -847,8 +879,8 @@ mod tests {
     let (stream, mut writable_rx) = make_test_stream();
 
     stream
-      .write(empty_subscribe_request())
-      .expect("write before close should succeed");
+      .write_raw(encode_buffer(&empty_subscribe_request()))
+      .expect("write_raw before close should succeed");
 
     let received = timeout(Duration::from_millis(200), writable_rx.recv())
       .await
@@ -868,8 +900,8 @@ mod tests {
     drop(writable_rx);
 
     let error = stream
-      .write(empty_subscribe_request())
-      .expect_err("write should fail when receiver is dropped");
+      .write_raw(encode_buffer(&empty_subscribe_request()))
+      .expect_err("write_raw should fail when receiver is dropped");
     let message = error.to_string().to_lowercase();
 
     assert!(
@@ -924,8 +956,8 @@ mod tests {
     }
 
     let error = stream
-      .write(empty_subscribe_request())
-      .expect_err("write should fail when writable lock is poisoned");
+      .write_raw(encode_buffer(&empty_subscribe_request()))
+      .expect_err("write_raw should fail when writable lock is poisoned");
     assert!(
       error
         .to_string()
@@ -946,7 +978,7 @@ mod tests {
     stream.close().expect("second close should succeed");
 
     let error = stream
-      .write(empty_subscribe_request())
+      .write_raw(encode_buffer(&empty_subscribe_request()))
       .expect_err("writes should stay rejected after repeated close");
     let message = error.to_string().to_lowercase();
 
@@ -966,7 +998,7 @@ mod tests {
 
       let (close_result, write_result) =
         tokio::join!(async move { stream_for_close.close() }, async move {
-          stream_for_write.write(empty_subscribe_request())
+          stream_for_write.write_raw(encode_buffer(&empty_subscribe_request()))
         });
 
       close_result.expect("close should never fail");
@@ -981,7 +1013,7 @@ mod tests {
       }
 
       let post_close_error = stream
-        .write(empty_subscribe_request())
+        .write_raw(encode_buffer(&empty_subscribe_request()))
         .expect_err("writes after close/write race should be rejected");
       let post_close_message = post_close_error.to_string().to_lowercase();
       assert!(
@@ -1021,34 +1053,6 @@ mod tests {
     assert!(
       message.contains("invalid subscriberequest payload"),
       "unexpected error message: {error}"
-    );
-  }
-
-  #[tokio::test]
-  async fn write_rejects_invalid_u64_input_with_nested_parse_cause() {
-    let (stream, _writable_rx) = make_test_stream();
-    let mut request = empty_subscribe_request();
-    request.accounts_data_slice = vec![JsSubscribeRequestAccountsDataSlice {
-      offset: "not-a-number".to_string(),
-      length: "1".to_string(),
-    }];
-
-    let error = stream
-      .write(request)
-      .expect_err("invalid u64 input should be rejected");
-    assert!(
-      error.to_string().contains("Invalid u64 value"),
-      "unexpected error message: {error}"
-    );
-    let cause_message = error
-      .cause
-      .as_ref()
-      .map(ToString::to_string)
-      .unwrap_or_default()
-      .to_lowercase();
-    assert!(
-      cause_message.contains("invalid digit"),
-      "expected parse error cause details, got: {cause_message}"
     );
   }
 
@@ -1173,7 +1177,7 @@ mod tests {
 
   #[tokio::test]
   async fn subscribe_read_returns_none_when_channel_closed_without_terminal_error() {
-    let (readable_tx, readable_rx) = unbounded_channel::<SubscribeUpdate>();
+    let (readable_tx, readable_rx) = unbounded_channel::<Vec<u8>>();
     drop(readable_tx);
     let readable = Arc::new(Mutex::new(readable_rx));
     let terminal_error = Arc::new(StdMutex::new(None));
@@ -1187,7 +1191,7 @@ mod tests {
 
   #[tokio::test]
   async fn subscribe_read_returns_terminal_error_when_channel_closed_after_worker_failure() {
-    let (readable_tx, readable_rx) = unbounded_channel::<SubscribeUpdate>();
+    let (readable_tx, readable_rx) = unbounded_channel::<Vec<u8>>();
     drop(readable_tx);
     let readable = Arc::new(Mutex::new(readable_rx));
     let terminal_error = Arc::new(StdMutex::new(Some(terminal_error_with_cause(
@@ -1213,7 +1217,7 @@ mod tests {
 
   #[tokio::test]
   async fn subscribe_read_returns_terminal_error_when_terminal_error_lock_is_poisoned() {
-    let (readable_tx, readable_rx) = unbounded_channel::<SubscribeUpdate>();
+    let (readable_tx, readable_rx) = unbounded_channel::<Vec<u8>>();
     drop(readable_tx);
     let readable = Arc::new(Mutex::new(readable_rx));
     let terminal_error = Arc::new(StdMutex::new(None));
@@ -1259,6 +1263,7 @@ mod tests {
     let request = SubscribeDeshredRequest {
       deshred_transactions,
       ping: None,
+      slots: HashMap::new(),
     };
 
     stream
@@ -1274,13 +1279,13 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn deshred_write_delivers_js_request_to_receiver() {
+  async fn deshred_write_raw_delivers_request_with_filters_and_ping_to_receiver() {
     let (stream, mut writable_rx) = make_test_deshred_stream();
 
     let mut deshred_transactions = HashMap::new();
     deshred_transactions.insert(
       "client".to_string(),
-      JsSubscribeRequestFilterDeshredTransactions {
+      SubscribeRequestFilterDeshredTransactions {
         vote: Some(false),
         account_include: vec!["acc1".to_string()],
         account_exclude: vec!["acc2".to_string()],
@@ -1288,14 +1293,15 @@ mod tests {
       },
     );
 
-    let request = JsSubscribeDeshredRequest {
+    let request = SubscribeDeshredRequest {
       deshred_transactions,
-      ping: Some(JsSubscribeRequestPing { id: 99 }),
+      ping: Some(SubscribeRequestPing { id: 99 }),
+      slots: HashMap::new(),
     };
 
     stream
-      .write(request)
-      .expect("write should succeed for valid JS deshred request");
+      .write_raw(encode_buffer(&request))
+      .expect("write_raw should succeed for valid deshred request");
 
     let received = timeout(Duration::from_millis(200), writable_rx.recv())
       .await
@@ -1357,8 +1363,8 @@ mod tests {
     stream.close().expect("close should succeed");
 
     let error = stream
-      .write(empty_subscribe_deshred_request())
-      .expect_err("write should fail after close");
+      .write_raw(encode_buffer(&empty_subscribe_deshred_request()))
+      .expect_err("write_raw should fail after close");
     let message = error.to_string().to_lowercase();
 
     assert!(
@@ -1374,8 +1380,8 @@ mod tests {
     drop(writable_rx);
 
     let error = stream
-      .write(empty_subscribe_deshred_request())
-      .expect_err("write should fail when deshred receiver is dropped");
+      .write_raw(encode_buffer(&empty_subscribe_deshred_request()))
+      .expect_err("write_raw should fail when deshred receiver is dropped");
     let message = error.to_string().to_lowercase();
 
     assert!(
@@ -1398,6 +1404,7 @@ mod tests {
         SubscribeDeshredRequest {
           deshred_transactions: HashMap::new(),
           ping: None,
+          slots: HashMap::new(),
         }
         .encode_to_vec(),
       ))
@@ -1419,7 +1426,7 @@ mod tests {
     stream.close().expect("second close should succeed");
 
     let error = stream
-      .write(empty_subscribe_deshred_request())
+      .write_raw(encode_buffer(&empty_subscribe_deshred_request()))
       .expect_err("writes should stay rejected after repeated close");
     let message = error.to_string().to_lowercase();
 
@@ -1439,7 +1446,7 @@ mod tests {
 
       let (close_result, write_result) =
         tokio::join!(async move { stream_for_close.close() }, async move {
-          stream_for_write.write(empty_subscribe_deshred_request())
+          stream_for_write.write_raw(encode_buffer(&empty_subscribe_deshred_request()))
         });
 
       close_result.expect("close should never fail");
@@ -1454,7 +1461,7 @@ mod tests {
       }
 
       let post_close_error = stream
-        .write(empty_subscribe_deshred_request())
+        .write_raw(encode_buffer(&empty_subscribe_deshred_request()))
         .expect_err("writes after close/write race should be rejected");
       let post_close_message = post_close_error.to_string().to_lowercase();
       assert!(
@@ -1506,8 +1513,8 @@ mod tests {
     }
 
     let error = stream
-      .write(empty_subscribe_deshred_request())
-      .expect_err("write should fail when writable lock is poisoned");
+      .write_raw(encode_buffer(&empty_subscribe_deshred_request()))
+      .expect_err("write_raw should fail when writable lock is poisoned");
     assert!(
       error
         .to_string()
@@ -1522,7 +1529,7 @@ mod tests {
 
   #[tokio::test]
   async fn deshred_read_returns_none_when_channel_closed_without_terminal_error() {
-    let (readable_tx, readable_rx) = unbounded_channel::<SubscribeUpdateDeshred>();
+    let (readable_tx, readable_rx) = unbounded_channel::<Vec<u8>>();
     drop(readable_tx);
     let readable = Arc::new(Mutex::new(readable_rx));
     let terminal_error = Arc::new(StdMutex::new(None));
@@ -1536,7 +1543,7 @@ mod tests {
 
   #[tokio::test]
   async fn deshred_read_returns_terminal_error_when_channel_closed_after_worker_failure() {
-    let (readable_tx, readable_rx) = unbounded_channel::<SubscribeUpdateDeshred>();
+    let (readable_tx, readable_rx) = unbounded_channel::<Vec<u8>>();
     drop(readable_tx);
     let readable = Arc::new(Mutex::new(readable_rx));
     let terminal_error = Arc::new(StdMutex::new(Some(terminal_error_with_cause(
@@ -1562,7 +1569,7 @@ mod tests {
 
   #[tokio::test]
   async fn deshred_read_returns_terminal_error_when_terminal_error_lock_is_poisoned() {
-    let (readable_tx, readable_rx) = unbounded_channel::<SubscribeUpdateDeshred>();
+    let (readable_tx, readable_rx) = unbounded_channel::<Vec<u8>>();
     drop(readable_tx);
     let readable = Arc::new(Mutex::new(readable_rx));
     let terminal_error = Arc::new(StdMutex::new(None));
