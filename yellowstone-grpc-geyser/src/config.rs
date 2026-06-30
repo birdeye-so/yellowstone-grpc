@@ -267,7 +267,9 @@ impl<'de> Deserialize<'de> for GrpcAddresses {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigGrpc {
-    /// Multiple addresses of Grpc service.
+    #[serde(default)]
+    pub enable_snapshot_accounts: bool,
+
     pub address: Option<GrpcAddresses>,
     /// TLS config
     pub tls_config: Option<TlsIdentityPair>,

@@ -42,6 +42,8 @@ pub struct PluginInner {
     grpc_channel: mpsc::UnboundedSender<Message>,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
+    encoder_handle: std::thread::JoinHandle<()>,
+    enable_snapshot_accounts: bool,
 }
 
 impl PluginInner {
@@ -81,10 +83,12 @@ impl GeyserPlugin for Plugin {
     fn on_load(&mut self, config_file: &str, is_reload: bool) -> PluginResult<()> {
         let config = Config::load_from_file(config_file)?;
         let filter_limits = config.grpc.filter_limits.clone();
+        let enable_snapshot_accounts = config.grpc.enable_snapshot_accounts;
 
         // Setup logger
         solana_logger::setup_with_default(&config.log.level);
 
+        log::info!("enable_snapshot_accounts: {}", enable_snapshot_accounts);
         log::info!("loading plugin: {}", self.name());
 
         // Reset metrics to prevent accumulation across plugin reload cycles
@@ -162,6 +166,8 @@ impl GeyserPlugin for Plugin {
             grpc_channel,
             plugin_cancellation_token,
             plugin_task_tracker,
+            encoder_handle,
+            enable_snapshot_accounts,
         });
 
         Ok(())
@@ -324,7 +330,9 @@ impl GeyserPlugin for Plugin {
     }
 
     fn account_data_snapshot_notifications_enabled(&self) -> bool {
-        false
+        self.inner
+            .as_ref()
+            .map_or(false, |i| i.enable_snapshot_accounts)
     }
 
     fn transaction_notifications_enabled(&self) -> bool {
