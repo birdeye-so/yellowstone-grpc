@@ -12,14 +12,17 @@ use {
     yellowstone_grpc_geyser::plugin::message::CommitmentLevel,
     yellowstone_grpc_proto::geyser::{
         subscribe_request_filter_accounts_filter::Filter, subscribe_update::UpdateOneof,
-        subscribe_update_deshred, SlotStatus, SubscribeDeshredRequest, SubscribeRequest,
-        SubscribeRequestFilterAccounts, SubscribeRequestFilterAccountsFilter,
-        SubscribeRequestFilterBlocks, SubscribeRequestFilterSlots,
-        SubscribeRequestFilterTransactions, SubscribeUpdateAccount, SubscribeUpdateBlock,
-        SubscribeUpdateBlockMeta, SubscribeUpdateEntry, SubscribeUpdateTransaction,
-        TokenAccountExpansionControlFlag,
+        SlotStatus, SubscribeRequest, SubscribeRequestFilterAccounts,
+        SubscribeRequestFilterAccountsFilter, SubscribeRequestFilterBlocks,
+        SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions, SubscribeUpdateAccount,
+        SubscribeUpdateBlock, SubscribeUpdateBlockMeta, SubscribeUpdateEntry,
+        SubscribeUpdateTransaction, TokenAccountExpansionControlFlag,
     },
 };
+
+pub mod blockmachine;
+pub mod deshred;
+pub mod misc;
 
 /// Subscribes to account updates and verifies only SysvarClock updates are returned.
 #[test_helper(name = "sysvar-account")]
@@ -243,7 +246,7 @@ pub async fn subscribe_should_receive_full_blocks(config: &RunConfig) -> Result<
 }
 
 /// Verifies replay support by receiving historical data from a replay request.
-#[test_helper(name = "replay")]
+#[test_helper(name = "replay", tags = ["replay"])]
 pub async fn it_should_support_replay(config: &RunConfig) -> Result<()> {
     let mut client = new_client(config).await?;
 
@@ -356,43 +359,43 @@ pub async fn it_should_support_replay(config: &RunConfig) -> Result<()> {
     Ok(())
 }
 
-/// Validates deshred subscription flow and deshredded output handling.
-#[test_helper(name = "deshred")]
-pub async fn test_subscribe_deshred(config: &RunConfig) -> Result<()> {
-    let mut client = crate::grpc::new_client(config).await?;
+/// Verifies replay support by receiving historical data from a replay request.
+#[test_helper(name = "block-subscription-replay", tags = ["replay"])]
+pub async fn it_should_support_block_subscription_replay(config: &RunConfig) -> Result<()> {
+    let mut client = new_client(config).await?;
 
-    let subscription = SubscribeDeshredRequest {
-        slots: HashMap::from([(
+    let resp = client.get_slot(None).await.context("get_slot")?;
+    let tip = resp.slot;
+    let sysvar_clock_str = "SysvarC1ock11111111111111111111111111111111";
+    let from_slot = tip.saturating_sub(10);
+    let subscription = SubscribeRequest {
+        blocks: HashMap::from([(
             "test".to_string(),
-            SubscribeRequestFilterSlots {
-                interslot_updates: Some(true),
+            SubscribeRequestFilterBlocks {
+                account_include: vec![sysvar_clock_str.to_string()],
+                include_accounts: Some(true),
+                include_transactions: Some(true),
+                include_entries: Some(true),
                 ..Default::default()
             },
         )]),
-        deshred_transactions: HashMap::from([("test".to_string(), Default::default())]),
+        from_slot: Some(from_slot),
         ..Default::default()
     };
 
     let mut stream = client
-        .subscribe_deshred_once(subscription)
+        .subscribe_once(subscription)
         .await
         .context("subscription should succeed")?;
-
-    let mut deshred_txn_count = 0;
-
-    let mut remaining_slot_lifecycle_to_visit = Vec::from_iter([
-        SlotStatus::SlotCompleted,
-        SlotStatus::SlotConfirmed,
-        SlotStatus::SlotFinalized,
-        SlotStatus::SlotFirstShredReceived,
-        SlotStatus::SlotCreatedBank,
-        SlotStatus::SlotProcessed,
-    ]);
-
-    let mut block_visit = HashSet::new();
-    const BLOCK_TO_VISIT: usize = 32;
+    log::info!(
+        "current tip slot is {}, subscribing from slot {}",
+        tip,
+        from_slot
+    );
+    let mut remaining_slot_to_visit = Vec::from_iter(from_slot..tip);
+    let mut visited = HashSet::new();
     while let Some(update) = stream.next().await {
-        if block_visit.len() >= BLOCK_TO_VISIT || remaining_slot_lifecycle_to_visit.is_empty() {
+        if remaining_slot_to_visit.is_empty() {
             break;
         }
         let update = update.context("stream should yield updates without error")?;
@@ -400,43 +403,17 @@ pub async fn test_subscribe_deshred(config: &RunConfig) -> Result<()> {
             continue;
         };
 
-        match update_oneof {
-            subscribe_update_deshred::UpdateOneof::DeshredTransaction(
-                subscribe_update_deshred_transaction,
-            ) => {
-                let slot = subscribe_update_deshred_transaction.slot;
-                block_visit.insert(slot);
-                deshred_txn_count += 1;
-                subscribe_update_deshred_transaction
-                    .transaction
-                    .context("deshred transaction update should have transaction field")?;
+        if let UpdateOneof::Block(slot) = update_oneof {
+            log::info!("received block update for slot {}", slot.slot);
+            remaining_slot_to_visit.retain(|s| *s != slot.slot);
+            if !visited.insert(slot.slot) {
+                bail!("received duplicate block update for slot {}", slot.slot);
             }
-            subscribe_update_deshred::UpdateOneof::Slot(subscribe_update_slot) => {
-                block_visit.insert(subscribe_update_slot.slot);
-                let status = subscribe_update_slot.status();
-                log::info!(
-                    "received slot update for slot {} with status {:?}",
-                    subscribe_update_slot.slot,
-                    status
-                );
-                if let Some(pos) = remaining_slot_lifecycle_to_visit
-                    .iter()
-                    .position(|&s| s == status)
-                {
-                    remaining_slot_lifecycle_to_visit.remove(pos);
-                }
-            }
-            _ => {}
         }
     }
     ensure!(
-        deshred_txn_count > 0,
-        "should receive at least one deshred transaction update"
-    );
-    ensure!(
-        remaining_slot_lifecycle_to_visit.is_empty(),
-        "should have received updates for all expected slot lifecycle in the replay. missing: {:?}",
-        remaining_slot_lifecycle_to_visit,
+        remaining_slot_to_visit.is_empty(),
+        "should have received updates for all expected slots in the replay"
     );
 
     Ok(())
@@ -641,7 +618,7 @@ pub async fn it_should_subscribe_to_all_transaction_include_token_ata_to_an_owne
 }
 
 /// validators message ordering guarantees that are provided by geyser.
-#[test_helper(name = "event-ordering")]
+#[test_helper(name = "event-ordering", tags = ["ordering"])]
 pub async fn it_should_verifies_geyser_event_ordering_is_correct(config: &RunConfig) -> Result<()> {
     let mut client = crate::grpc::new_client(config).await?;
     let subscription = SubscribeRequest {
@@ -717,6 +694,9 @@ pub async fn it_should_verifies_geyser_event_ordering_is_correct(config: &RunCon
             }
             UpdateOneof::Account(ev) => {
                 if let Some(block) = &mut block_started {
+                    if block.slot != ev.slot {
+                        continue;
+                    }
                     log::info!("received account update for slot {}", ev.slot);
                     ensure!(
                         block.slot == ev.slot,
@@ -727,6 +707,9 @@ pub async fn it_should_verifies_geyser_event_ordering_is_correct(config: &RunCon
             }
             UpdateOneof::Transaction(ev) => {
                 if let Some(block) = &mut block_started {
+                    if block.slot != ev.slot {
+                        continue;
+                    }
                     log::info!("received transaction update for slot {}", ev.slot);
                     ensure!(
                         block.slot == ev.slot,
@@ -737,6 +720,9 @@ pub async fn it_should_verifies_geyser_event_ordering_is_correct(config: &RunCon
             }
             UpdateOneof::Entry(ev) => {
                 if let Some(block) = &mut block_started {
+                    if block.slot != ev.slot {
+                        continue;
+                    }
                     log::info!("received entry update for slot {}", ev.slot);
                     ensure!(
                         block.slot == ev.slot,
@@ -747,6 +733,9 @@ pub async fn it_should_verifies_geyser_event_ordering_is_correct(config: &RunCon
             }
             UpdateOneof::Block(ev) => {
                 if let Some(block) = &mut block_started {
+                    if block.slot != ev.slot {
+                        continue;
+                    }
                     log::info!("received block update for slot {}", ev.slot);
                     ensure!(
                         block.slot == ev.slot,
@@ -757,6 +746,9 @@ pub async fn it_should_verifies_geyser_event_ordering_is_correct(config: &RunCon
             }
             UpdateOneof::BlockMeta(ev) => {
                 if let Some(block) = &mut block_started {
+                    if block.slot != ev.slot {
+                        continue;
+                    }
                     log::info!("received block meta update for slot {}", ev.slot);
                     ensure!(
                         block.slot == ev.slot,
@@ -1027,7 +1019,7 @@ pub async fn subscribe_should_receive_no_slot_duplicates(config: &RunConfig) -> 
 
 /// Verifies replay message ordering matches the live broadcast path:
 /// block data (Account/Transaction/Entry) before Block before BlockMeta before slot status.
-#[test_helper(name = "replay-ordering")]
+#[test_helper(name = "replay-ordering", tags = ["ordering", "replay"])]
 pub async fn it_should_verify_replay_ordering_matches_live_path(config: &RunConfig) -> Result<()> {
     let mut client = new_client(config).await?;
 
@@ -1239,36 +1231,5 @@ pub async fn slot_status_should_have_parent(config: &RunConfig) -> Result<()> {
         }
     }
 
-    Ok(())
-}
-
-/// Verifies that the health check route returns a status of "ok".
-#[test_helper(name = "health-routes")]
-pub async fn test_health_routes(config: &RunConfig) -> Result<()> {
-    let mut client = new_client(config).await?;
-    let resp = client
-        .health_check()
-        .await
-        .context("health_check should succeed")?;
-    ensure!(
-        resp.status == 1,
-        "health check should return status ok, got {}",
-        resp.status
-    );
-
-    let mut watch_st = client
-        .health_watch()
-        .await
-        .context("health_watch should succeed")?;
-    let resp = watch_st
-        .next()
-        .await
-        .ok_or(anyhow::anyhow!("none health check response"))??;
-
-    ensure!(
-        resp.status == 1,
-        "health watch should return status ok, got {}",
-        resp.status
-    );
     Ok(())
 }

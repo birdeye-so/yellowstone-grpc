@@ -2,7 +2,7 @@ use {
     crate::{
         config::Config,
         file_watcher::FileWatcher,
-        grpc::{BlockReconstructionMessage, BroadcastedMessage, GrpcService},
+        grpc::{BlockReconstructionMessage, GrpcService, SubscriberChannels},
         metrics::{self, incr_geyser_event_dropped, PrometheusService},
         plugin::{
             filter::limits::FilterLimits,
@@ -44,7 +44,7 @@ pub struct PluginInner {
     grpc_channel: mpsc::UnboundedSender<Message>, // geyser_loop
     deshred_channel: broadcast::Sender<Message>,  // deshred_client_loop
     block_reconstruction_channel: mpsc::UnboundedSender<BlockReconstructionMessage>, // block_reconstruction_loop
-    broadcast_channel: broadcast::Sender<BroadcastedMessage>,                        // client_loop
+    broadcast_channel: SubscriberChannels,                                           // client_loop
     blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
@@ -74,8 +74,8 @@ impl PluginInner {
     }
 
     // Sends messages to all subscribed clients if their filter matches the message.
-    fn send_broadcast_message(&self, message: BroadcastedMessage) {
-        let _ = self.broadcast_channel.send(message);
+    fn send_broadcast_message(&self, commitment: CommitmentLevel, messages: Arc<Vec<Message>>) {
+        self.broadcast_channel.send(commitment, messages);
     }
 
     // Sends messages to block meta storage
@@ -201,7 +201,7 @@ impl GeyserPlugin for Plugin {
             grpc_channel: grpc_channel_tx,
             deshred_channel: grpc_service_result.deshred_broadcast_tx,
             block_reconstruction_channel: grpc_service_result.block_reconstruction_tx,
-            broadcast_channel: grpc_service_result.broadcast_tx,
+            broadcast_channel: grpc_service_result.broadcast,
             blocks_meta_tx: grpc_service_result.blocks_meta_tx,
             plugin_cancellation_token,
             plugin_task_tracker,
@@ -258,8 +258,9 @@ impl GeyserPlugin for Plugin {
 
             if is_startup {
                 if let Some(channel) = inner.snapshot_channel.lock().unwrap().as_ref() {
-                    let message =
-                        Message::Account(MessageAccount::from_geyser(account, slot, is_startup));
+                    let message = Message::Account(Arc::new(MessageAccount::from_geyser(
+                        account, slot, is_startup,
+                    )));
                     match channel.send(Box::new(message)) {
                         Ok(()) => metrics::message_queue_size_inc(),
                         Err(_) => {
@@ -272,8 +273,9 @@ impl GeyserPlugin for Plugin {
                     }
                 }
             } else {
-                let message =
-                    Message::Account(MessageAccount::from_geyser(account, slot, is_startup));
+                let message = Message::Account(Arc::new(MessageAccount::from_geyser(
+                    account, slot, is_startup,
+                )));
                 inner.send_message(message);
             }
 
@@ -295,8 +297,7 @@ impl GeyserPlugin for Plugin {
         status: &SlotStatus,
     ) -> PluginResult<()> {
         self.with_inner(|inner| {
-            let message = Message::Slot(MessageSlot::from_geyser(slot, parent, status));
-
+            let message = Message::Slot(Arc::new(MessageSlot::from_geyser(slot, parent, status)));
             if matches!(
                 status,
                 SlotStatus::Processed | SlotStatus::Confirmed | SlotStatus::Rooted
@@ -326,11 +327,8 @@ impl GeyserPlugin for Plugin {
                     // FirstShredReceived/Completed/CreatedBank/Dead slot status updates for Confirmed/Finalized commitment subscribers are not explicitly sent by the block reconstruction loop.
                     // Therefore we explicitly need to forward these updates to the subscribers for all commitment levels, the geyser_loop will take care of forwarding them to the Processed commitment level.
                     let messages = Arc::new(vec![message.clone()]);
-                    inner.send_broadcast_message((
-                        CommitmentLevel::Confirmed,
-                        Arc::clone(&messages),
-                    ));
-                    inner.send_broadcast_message((CommitmentLevel::Finalized, messages));
+                    inner.send_broadcast_message(CommitmentLevel::Confirmed, Arc::clone(&messages));
+                    inner.send_broadcast_message(CommitmentLevel::Finalized, messages);
                 }
             }
 
@@ -361,7 +359,8 @@ impl GeyserPlugin for Plugin {
                 ReplicaTransactionInfoVersions::V0_0_3(info) => info,
             };
 
-            let message = Message::Transaction(MessageTransaction::from_geyser(transaction, slot));
+            let message =
+                Message::Transaction(Arc::new(MessageTransaction::from_geyser(transaction, slot)));
             inner.send_message(message);
 
             Ok(())
@@ -401,9 +400,13 @@ impl GeyserPlugin for Plugin {
             };
 
             let message = Message::BlockMeta(Arc::new(MessageBlockMeta::from_geyser(blockinfo)));
-            inner.send_block_reconstruction_message(BlockReconstructionMessage::Single(
-                message.clone(),
-            ));
+
+            // It's super important that block-meta message goes to the geyser loop message channel,
+            // and not straight to block-reconstruction.
+            // The reason why is during block freeze, in agave, some account update are emitted really late, but before block-meta.
+            // In order to guarantee those account update are seen by the block-reconstruction state machine and all downstream customer,
+            // we must send the block-meta message to the geyser loop, so that it be emitted to the block-reconstruction loop after all account update messages have been processed.
+            inner.send_message(message.clone());
             inner.send_blocks_meta_message(message);
 
             Ok(())
@@ -416,9 +419,9 @@ impl GeyserPlugin for Plugin {
         slot: u64,
     ) -> PluginResult<()> {
         self.with_inner(|inner| {
-            let message = Message::DeshredTransaction(
+            let message = Message::DeshredTransaction(Arc::new(
                 MessageDeshredTransaction::from_geyser_versioned(transaction, slot),
-            );
+            ));
             inner.send_deshred_message(message);
 
             Ok(())
