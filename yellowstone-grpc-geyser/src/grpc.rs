@@ -1654,19 +1654,11 @@ impl GrpcService {
 
                     for message in messages.iter() {
                         for message in session.filter.get_updates(message, Some(commitment)) {
-                            match stream_tx.try_send(Ok(message)) {
+                            match stream_tx.send(Ok(message)).await {
                                 Ok(()) => {
                                     metrics::incr_grpc_message_sent_counter(&session.subscriber_id);
                                 }
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    error!("client #{}: lagged to send an update", session.subscriber_id);
-                                    task_tracker.spawn(async move {
-                                        let _ = stream_tx.send(Err(Status::internal("lagged to send an update"))).await;
-                                    });
-                                    session.disconnect_reason = "client_channel_full";
-                                    break 'outer;
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                Err(mpsc::error::SendError(_)) => {
                                     error!("client #{}: stream closed", session.subscriber_id);
                                     session.disconnect_reason = "client_closed";
                                     break 'outer;
@@ -2000,19 +1992,11 @@ impl GrpcService {
                     metrics::deshred_queue_size_dec();
 
                     for update in session.filter.get_updates(&message, None) {
-                        match stream_tx.try_send(Ok(update)) {
+                        match stream_tx.send(Ok(update)).await {
                             Ok(()) => {
                                 metrics::incr_grpc_message_sent_counter(&session.subscriber_id);
                             }
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                error!("deshred client #{}/{}: lagged to send an update", session.subscriber_id, session.id);
-                                session.disconnect_reason = "client_channel_full";
-                                task_tracker.spawn(async move {
-                                    let _ = stream_tx.send(Err(Status::internal("lagged to send an update"))).await;
-                                });
-                                break 'outer;
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                            Err(mpsc::error::SendError(_)) => {
                                 error!("deshred client #{}/{}: stream closed", session.subscriber_id, session.id);
                                 session.disconnect_reason = "client_closed";
                                 break 'outer;
